@@ -49,7 +49,13 @@ _rec_stop = {"flag": False}
 
 
 def bot_loop():
-    """后台挂机线程：监听 loopback，听到咬钩音效即按键。"""
+    """后台挂机线程：监听 loopback，听到咬钩音效即按动作。
+
+    点击策略（修复旧版两大 bug）：
+      1. 单帧误触 → 引入「连续命中」：必须 min_strikes 个音频块连续超阈值才触发
+      2. 切出游戏后漏点 → 引入「前台窗口白名单」：前台窗口标题不含
+         cfg['foreground_window'] 时整轮跳过按键
+    """
     # soundcard 依赖 COM，而 COM 按线程初始化，工作线程必须自己初始化一次
     fb.init_com()
     while STATE["running"]:
@@ -65,9 +71,16 @@ def bot_loop():
             buf = fb.RollingBuffer(len(tmpl) + int(rate * 0.2))
             chunk = max(int(rate * 0.05), 1024)
             last_press = 0.0
+            strike = 0  # 连续命中阈值的累计块数（每次触发后或低于阈值时清零）
+            fw = str(cfg.get("foreground_window", "") or "")
+            print(f"[bot_loop] 已就绪 | 阈值 {cfg['threshold']} | 冷却 "
+                  f"{cfg['cooldown']}s | 连击 {cfg.get('click_count', 3)} × "
+                  f"{cfg.get('click_interval_ms', 80)}ms | 连续命中 ≥ "
+                  f"{cfg.get('min_strikes', 3)} 块 | 前台窗口: "
+                  f"{fw if fw else '（不限——切出游戏也会按键！）'}")
             with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
                 while STATE["running"]:
-                    cfg = fb.load_config()  # 热更新阈值/冷却/动作
+                    cfg = fb.load_config()  # 热更新阈值/冷却/动作/连击/前台等
                     data = rec.record(numframes=chunk)
                     mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
                     buf.push(mono)
@@ -78,13 +91,33 @@ def bot_loop():
                         (mono.astype("float32") ** 2).mean() ** 0.5), 4)
                     STATE["error"] = None
                     now = time.time()
-                    if (score >= float(cfg["threshold"])
-                            and now - last_press >= float(cfg["cooldown"])):
-                        fb.do_action(cfg["action"])
+
+                    threshold = float(cfg["threshold"])
+                    cooldown = float(cfg["cooldown"])
+                    min_strikes = max(1, int(cfg.get("min_strikes", 3)))
+                    click_count = max(1, int(cfg.get("click_count", 3)))
+                    click_interval_ms = int(cfg.get("click_interval_ms", 80))
+                    foreground_window = str(cfg.get("foreground_window", "") or "")
+
+                    # 连续命中门槛：只有持续命中（min_strikes 块以上）才算真的咬钩
+                    if score >= threshold:
+                        strike += 1
+                    else:
+                        strike = 0
+
+                    if (strike >= min_strikes
+                            and now - last_press >= cooldown):
+                        fb.do_action(
+                            cfg["action"],
+                            click_count=click_count,
+                            click_interval_ms=click_interval_ms,
+                            foreground_window=foreground_window,
+                        )
                         last_press = now
                         STATE["count"] += 1
                         STATE["last"] = time.strftime("%H:%M:%S")
                         STATE["peak"] = 0.0  # 重置峰值，便于观察下一次咬钩
+                        strike = 0
         except Exception as e:
             STATE["error"] = f"{type(e).__name__}: {e}"
             traceback.print_exc()
@@ -272,7 +305,8 @@ def save_cropped(start_sec, end_sec, save_as=None):
 def test_action(countdown=3.0):
     """
     倒计时 `countdown` 秒后，按配置中的 action。
-    给用户时间切到游戏窗口。
+    与挂机线程保持一致（也走连击），但不强制前台窗口——你想测按键时并不一定要把
+    焦点先切回游戏。
     """
     with _lock:
         if STATE["act"]["running"]:
@@ -289,7 +323,12 @@ def test_action(countdown=3.0):
                     break
                 time.sleep(0.1)
             cfg = fb.load_config()
-            fb.do_action(cfg["action"])
+            fb.do_action(
+                cfg["action"],
+                click_count=int(cfg.get("click_count", 3)),
+                click_interval_ms=int(cfg.get("click_interval_ms", 80)),
+                foreground_window="",  # 测试不限制前台
+            )
         except Exception as e:
             traceback.print_exc()
             STATE["error"] = f"按键测试失败: {e}"
@@ -385,7 +424,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = self._body_json()
                 cfg = fb.load_config()
                 for k in ("sound_file", "threshold", "cooldown", "action",
-                          "samplerate", "device"):
+                          "samplerate", "device",
+                          "click_count", "click_interval_ms", "min_strikes",
+                          "foreground_window"):
                     if k in data:
                         cfg[k] = data[k]
                 fb.save_config(cfg)

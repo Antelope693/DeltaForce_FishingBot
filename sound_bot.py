@@ -45,6 +45,16 @@ DEFAULT_CONFIG = {
     "samplerate": 48000,
     # 音频输出设备名（null = 系统默认输出；填设备名子串可指定如 "耳机"）
     "device": None,
+    # ---- 防误触 + 防切走漏点 ----
+    # 每次触发连击几下（>1 用于模拟咬钩瞬间的快速点击，1 = 单击）
+    "click_count": 3,
+    # 连击之间的间隔（毫秒）
+    "click_interval_ms": 80,
+    # 至少连续 N 个音频块命中阈值才触发（防单帧噪声；3 块 ≈ 150ms）
+    "min_strikes": 3,
+    # 仅当当前前台窗口标题含此子串时才点击；空 = 不限制。
+    # 设成游戏窗口标题的关键字（如 "Delta"），可彻底避免切出游戏后还在按键。
+    "foreground_window": "",
 }
 
 # ---------------- Win32 按键注入 ----------------
@@ -76,12 +86,51 @@ def send_left_click():
         ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def do_action(action):
-    if action == "click":
-        send_left_click()
-    else:
-        import keyboard
-        keyboard.press_and_release(action)
+def get_foreground_title():
+    """获取当前前台窗口标题（best effort）。失败时返回空串。"""
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def do_action(action, click_count=1, click_interval_ms=80, foreground_window=""):
+    """
+    执行一次"动作"。
+    新参数（均向后兼容，不传 = 旧版行为）：
+      - click_count    : 一次触发连击几下（>1 等同于快速点击，常用于"收杆"瞬间）
+      - click_interval_ms : 每次点击之间的毫秒间隔（默认 80ms）
+      - foreground_window : 非空时，仅当当前前台窗口标题含此子串才真的按键；
+                          空 = 不限制（旧行为）。这样切出游戏窗口之后不会把按键漏给
+                          浏览器/桌面，便于避免"切走后还在一直点"的 bug。
+    """
+    fg_title = ""
+    if foreground_window:
+        fg_title = get_foreground_title()
+        if foreground_window not in fg_title:
+            print(f"[跳过] 前台窗口不符（{fg_title or '(空)'!r}，需含 "
+                  f"{foreground_window!r}），本轮不按键")
+            return False
+    n = max(1, int(click_count))
+    delay = max(0.0, int(click_interval_ms) / 1000.0)
+    for i in range(n):
+        if i:
+            # 微小间隔 0 也不要真"无延迟连发"，系统不一定跟得上，5ms 兜底
+            time.sleep(delay if delay > 0 else 0.005)
+        if action == "click":
+            send_left_click()
+        else:
+            import keyboard
+            keyboard.press_and_release(action)
+    return True
 
 
 # ---------------- 配置读写 ----------------
@@ -413,7 +462,16 @@ def main():
     print("钓鱼挂机（声音版）已启动")
     print(f"  参考音效: {os.path.basename(wav)}")
     print(f"  得分阈值: {cfg['threshold']}  冷却: {cfg['cooldown']}s")
-    print(f"  触发动作: {cfg['action']}")
+    n_clicks = int(cfg.get('click_count', 1))
+    if n_clicks > 1:
+        print(f"  触发动作: {cfg['action']} × {n_clicks} "
+              f"(每 {cfg.get('click_interval_ms', 80)}ms)")
+    else:
+        print(f"  触发动作: {cfg['action']}")
+    print(f"  连续命中门槛: {cfg.get('min_strikes', 3)} 块 (≈ "
+          f"{int(cfg.get('min_strikes', 3)) * 50}ms)")
+    fw = cfg.get('foreground_window', '') or ''
+    print(f"  前台窗口限制: {fw if fw else '（无，切出游戏也会按键，请慎用）'}")
     print("  听到咬钩音效 -> 按键 | F9 手动抛竿 | F10 退出")
     print("=" * 56)
 

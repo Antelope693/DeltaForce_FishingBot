@@ -56,6 +56,12 @@
     <label>监听设备 <select id="device"></select></label>
     <label>采样率 <input id="samplerate" type="number"></label>
   </div>
+  <div class="row">
+    <label>连击次数 <input id="click_count" type="number" step="1" min="1" max="20" title="每次触发连击几下，模拟收杆瞬间的快速点击"></label>
+    <label>连击间隔(ms) <input id="click_interval_ms" type="number" step="20" min="0" title="每次连击之间的毫秒间隔"></label>
+    <label>连续命中门槛 <input id="min_strikes" type="number" step="1" min="1" max="20" title="至少连续 N 个音频块命中阈值才触发（防单帧噪声）"></label>
+    <label>前台窗口限制 <input id="foreground_window" type="text" placeholder="留空=不限制（推荐填游戏标题）" title="仅当前台窗口标题含此子串时才点击；填游戏窗口标题的关键字，可彻底避免切出游戏后还在按键"></label>
+  </div>
 </fieldset>
 <div class="row">
   <button onclick="saveCfg()">💾 保存配置</button>
@@ -103,7 +109,8 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const FIELDS = ["sound_file","threshold","cooldown","action","samplerate","device"];
+const FIELDS = ["sound_file","threshold","cooldown","action","samplerate","device",
+               "click_count","click_interval_ms","min_strikes","foreground_window"];
 let dirty = false;          // 有未保存的修改时不覆盖输入框
 let devicesLoaded = false;
 let shownConfig = "";       // 上次已渲染的服务端配置
@@ -127,6 +134,10 @@ function fillForm(c) {
   $("action").value = c.action;
   $("samplerate").value = c.samplerate;
   $("device").value = c.device || "";
+  $("click_count").value = c.click_count;
+  $("click_interval_ms").value = c.click_interval_ms;
+  $("min_strikes").value = c.min_strikes;
+  $("foreground_window").value = c.foreground_window || "";
 }
 
 function loadDevices(c) {
@@ -265,6 +276,10 @@ async function saveCfg() {
     action: $("action").value.trim() || "click",
     samplerate: +$("samplerate").value || 48000,
     device: $("device").value || null,
+    click_count: Math.max(1, Math.floor(+$("click_count").value || 3)),
+    click_interval_ms: Math.max(0, Math.floor(+$("click_interval_ms").value || 80)),
+    min_strikes: Math.max(1, Math.floor(+$("min_strikes").value || 3)),
+    foreground_window: $("foreground_window").value.trim(),
   };
   const r = await (await fetch("/api/config", {
     method: "POST", headers: {"Content-Type": "application/json"},
