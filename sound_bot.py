@@ -16,6 +16,7 @@
 
 import argparse
 import ctypes
+import ctypes.wintypes
 import json
 import os
 import sys
@@ -26,7 +27,7 @@ import numpy as np
 import soundcard as sc
 
 # 说明：soundcard 必须在**主线程**完成导入——它在导入时会初始化所在线程的 COM，
-# 且无法容忍“本线程已初始化过”（会抛 Error 0x100000001）。
+# 且无法容忍"本线程已初始化过"（会抛 Error 0x100000001）。
 # 所以：主线程先导入（本行），其他工作线程使用前调用 init_com() 单独初始化。
 
 # ---------------- 配置 ----------------
@@ -36,7 +37,7 @@ DEFAULT_CONFIG = {
     # 参考音效文件（相对本目录或绝对路径）
     "sound_file": "TIMETOUP.wav",
     # 归一化互相关得分阈值（0~1，越高越严格，建议 0.6~0.85）
-    "threshold": 0.7,
+    "threshold": 0.6,
     # 两次触发之间的最短冷却（秒）
     "cooldown": 2.0,
     # 触发动作："click" = 鼠标左键（当前光标位置）；或键名 "f" / "space" 等
@@ -45,47 +46,210 @@ DEFAULT_CONFIG = {
     "samplerate": 48000,
     # 音频输出设备名（null = 系统默认输出；填设备名子串可指定如 "耳机"）
     "device": None,
-    # ---- 防误触 + 防切走漏点 ----
-    # 每次触发连击几下（>1 用于模拟咬钩瞬间的快速点击，1 = 单击）
-    "click_count": 3,
-    # 连击之间的间隔（毫秒）
+    # ---- 点击驱动（4 选 1）----
+    #   sendinput   : Win32 SendInput(MOUSEINPUT)  现代 API
+    #   mouse_event : Win32 mouse_event            旧 API，部分反作弊不拦这个
+    #   postmessage : PostMessage(WM_LBUTTONDOWN/UP) 到游戏窗口   绕过 raw-input 反作弊
+    #   sendmessage : SendMessage(WM_LBUTTONDOWN/UP) 同步版       同上，但会等消息处理完
+    # 三角洲里如果 sendinput 没反应，依次试 postmessage / mouse_event
+    "click_driver": "sendinput",
+    # ---- 单击 vs 连击 ----
+    # 点击次数（钓鱼游戏收杆就是 1 下，别多加）
+    "click_count": 1,
+    # 连击之间的间隔（毫秒），>1 时才有用
     "click_interval_ms": 80,
-    # 至少连续 N 个音频块命中阈值才触发（防单帧噪声；3 块 ≈ 150ms）
-    "min_strikes": 3,
-    # 仅当当前前台窗口标题含此子串时才点击；空 = 不限制。
-    # 设成游戏窗口标题的关键字（如 "Delta"），可彻底避免切出游戏后还在按键。
-    "foreground_window": "",
+    # ---- 防误触 ----
+    # 至少连续 N 个音频块命中阈值才触发（防单帧噪声；2 块 ≈ 100ms，钓鱼咬钩至少几百毫秒）
+    "min_strikes": 2,
+    # ---- 防切走漏点 ----
+    # 仅当当前前台窗口标题含此子串时才点击；空 = 不限制（强烈不推荐，会把点击发给其他 APP）。
+    # 设成游戏窗口标题的关键字（如 "三角洲"），可彻底避免切出游戏后还在按键。
+    "foreground_window": "三角洲",
+    # ---- 备份方案 ----
+    # 如果 click 失败（被反作弊吞了），自动追加按这个键（键名见 VK 映射）；
+    #   空 = 不备份；"space" = 空格；"f" = F 键；"e" = E 键；"q" = Q 键
+    # 三角洲钓鱼是左键，所以默认不启用；只有其他方案都失败再考虑
+    "key_fallback": "",
 }
 
-# ---------------- Win32 按键注入 ----------------
+# ---------------- Win32 常量 ----------------
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_LEFTUP   = 0x0004
+KEYEVENTF_KEYUP      = 0x0002
+WM_LBUTTONDOWN       = 0x0201
+WM_LBUTTONUP         = 0x0202
+MK_LBUTTON           = 0x0001
 
+# 键名 -> Virtual-Key code（仅列常用的；其它键查 VK 表）
+VK_MAP = {
+    'space': 0x20, 'spacebar': 0x20,
+    'enter': 0x0D, 'return': 0x0D,
+    'esc': 0x1B, 'escape': 0x1B, 'tab': 0x09,
+    'shift': 0x10, 'ctrl': 0x11, 'alt': 0x12,
+    'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28,
+    '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34,
+    '5': 0x35, '6': 0x36, '7': 0x37, '8': 0x38, '9': 0x39,
+    'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45,
+    'f': 0x46, 'g': 0x47, 'h': 0x48, 'i': 0x49, 'j': 0x4A,
+    'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E, 'o': 0x4F,
+    'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54,
+    'u': 0x55, 'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
+    'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73, 'f5': 0x74,
+    'f6': 0x75, 'f7': 0x76, 'f8': 0x77, 'f9': 0x78, 'f10': 0x79,
+    'f11': 0x7A, 'f12': 0x7B,
+    'lmb': 0x01, 'rmb': 0x02, 'mmb': 0x04,
+}
 
+# ---------------- Win32 结构体 ----------------
 class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
-                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR = 64-bit pointer size
+    ]
 
 
-class _INPUTunion(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
 
 
 class INPUT(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTunion)]
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("union", _INPUTUNION),
+    ]
 
 
-def send_left_click():
-    """在当前光标位置发送一次鼠标左键点击。"""
-    for flag in (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP):
-        inp = INPUT(type=INPUT_MOUSE)
-        inp.union.mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
-        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+# ---------------- 4 种点击驱动 ----------------
+def _send_input_mouse(flag):
+    """现代 API：SendInput 注入一只鼠标事件。返回 1 表示成功。"""
+    cb = ctypes.sizeof(INPUT)
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.union.mi = MOUSEINPUT(0, 0, 0, flag, 0, 0)
+    return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), cb)
 
 
+def _click_sendinput():
+    """驱动 1：SendInput + MOUSEINPUT（最现代、最标准）。"""
+    n1 = _send_input_mouse(MOUSEEVENTF_LEFTDOWN)
+    n2 = _send_input_mouse(MOUSEEVENTF_LEFTUP)
+    ok = (n1 == 1) and (n2 == 1)
+    if not ok:
+        err = ctypes.windll.kernel32.GetLastError()
+        print(f"[click_sendinput] 失败 n1={n1} n2={n2} GetLastError={err}")
+    return ok
+
+
+def _click_mouse_event():
+    """驱动 2：旧 API mouse_event（部分反作弊不拦这个）。"""
+    ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.01)  # 10ms DOWN/UP 间隔，避免系统合并
+    ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP,   0, 0, 0, 0)
+    return True
+
+
+def _click_post_or_send(hwnd, post):
+    """驱动 3 / 4：PostMessage 或 SendMessage WM_LBUTTONDOWN/UP 到窗口中心。"""
+    if not hwnd:
+        return False
+    rect = ctypes.wintypes.RECT()
+    if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return False
+    cx = (rect.left + rect.right) // 2
+    cy = (rect.top + rect.bottom) // 2
+    lparam = (cy << 16) | (cx & 0xFFFF)
+    fn = ctypes.windll.user32.PostMessageW if post else ctypes.windll.user32.SendMessageW
+    fn(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    time.sleep(0.01)
+    fn(hwnd, WM_LBUTTONUP, 0, lparam)
+    return True
+
+
+def _click_postmessage(hwnd):
+    return _click_post_or_send(hwnd, post=True)
+
+
+def _click_sendmessage(hwnd):
+    return _click_post_or_send(hwnd, post=False)
+
+
+def _press_key_sendinput(vk):
+    """通过 SendInput 注入 KEYBDINPUT DOWN/UP。"""
+    cb = ctypes.sizeof(INPUT)
+    for flag in (0x0000, KEYEVENTF_KEYUP):  # DOWN, UP
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.union.ki = KEYBDINPUT(vk, 0, flag, 0, 0)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), cb)
+    return True
+
+
+DRIVERS = {
+    "sendinput":   _click_sendinput,
+    "mouse_event": _click_mouse_event,
+    "postmessage": _click_postmessage,
+    "sendmessage": _click_sendmessage,
+}
+
+
+# ---------------- 键注入 ----------------
+def press_key(action):
+    """
+    按下指定键（同步版）。
+    action 支持：
+      - "click" / "lmb" / "left"  : 鼠标左键（走 click_driver）
+      - 其它键名（"space"/"f"/"e"/"q"/数字等）: 走 SendInput(KEYBDINPUT)
+      - "vk:0xXX"  : 直接用十六进制 VK 码
+    返回 True/False。
+    """
+    if not action:
+        return False
+    a = action.strip().lower()
+    if a in ("click", "lmb", "left", "mouse_left"):
+        # 鼠标左键走驱动链（外部调用 do_action 处理）
+        return _click_sendinput()
+    if a.startswith("vk:"):
+        try:
+            vk = int(a[3:], 16)
+            return _press_key_sendinput(vk)
+        except Exception:
+            return False
+    vk = VK_MAP.get(a)
+    if vk is None:
+        print(f"[press_key] 未知键名: {action!r}")
+        return False
+    return _press_key_sendinput(vk)
+
+
+# ---------------- 前台窗口 ----------------
 def get_foreground_title():
     """获取当前前台窗口标题（best effort）。失败时返回空串。"""
     try:
@@ -102,35 +266,103 @@ def get_foreground_title():
         return ""
 
 
-def do_action(action, click_count=1, click_interval_ms=80, foreground_window=""):
+def find_window_by_title_sub(sub, prefer_foreground=True):
+    """
+    在所有可见顶层窗口中查找标题含 `sub`（不区分大小写）的窗口。
+    prefer_foreground=True 时优先返回前台窗口（若它本身匹配）。
+    返回 (hwnd, title) 或 (0, "")。
+    """
+    sub_l = sub.lower()
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    found = []
+
+    def cb(hwnd, _):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+        title = buf.value or ""
+        if sub_l in title.lower():
+            found.append((hwnd, title))
+        return True
+
+    ctypes.windll.user32.EnumWindows(EnumWindowsProc(cb), 0)
+    if not found:
+        return 0, ""
+    if prefer_foreground:
+        fg = ctypes.windll.user32.GetForegroundWindow()
+        for hwnd, title in found:
+            if hwnd == fg:
+                return hwnd, title
+    return found[0]
+
+
+# ---------------- 主动作 ----------------
+def do_action(action, click_count=1, click_interval_ms=80,
+              foreground_window="", click_driver="sendinput",
+              key_fallback=""):
     """
     执行一次"动作"。
-    新参数（均向后兼容，不传 = 旧版行为）：
-      - click_count    : 一次触发连击几下（>1 等同于快速点击，常用于"收杆"瞬间）
-      - click_interval_ms : 每次点击之间的毫秒间隔（默认 80ms）
+    新参数（均向后兼容）：
+      - click_count    : 一次触发连击几下（默认 1，钓鱼收杆就 1 下）
+      - click_interval_ms : 每次点击之间的毫秒间隔
       - foreground_window : 非空时，仅当当前前台窗口标题含此子串才真的按键；
-                          空 = 不限制（旧行为）。这样切出游戏窗口之后不会把按键漏给
-                          浏览器/桌面，便于避免"切走后还在一直点"的 bug。
+                          空 = 不限制（旧行为，但强烈不建议）
+      - click_driver   : sendinput / mouse_event / postmessage / sendmessage
+      - key_fallback   : 如果 click 被反作弊挡了，自动追加按这个键
+    返回 True 表示动作已发出；False 表示被前台窗口限制或失败。
     """
     fg_title = ""
     if foreground_window:
         fg_title = get_foreground_title()
-        if foreground_window not in fg_title:
-            print(f"[跳过] 前台窗口不符（{fg_title or '(空)'!r}，需含 "
-                  f"{foreground_window!r}），本轮不按键")
+        if foreground_window.lower() not in fg_title.lower():
+            print(f"[跳过] 前台窗口不符（当前={fg_title!r}，需含 "
+                  f"{foreground_window!r}）—— 不会按键")
             return False
+    else:
+        # 无前台限制时，每次触发都警告（避免切走后漏点）
+        print("[!] foreground_window 未设置，任何前台窗口都会收到按键 "
+              "（强烈建议填游戏标题子串，如 '三角洲'）")
+
     n = max(1, int(click_count))
     delay = max(0.0, int(click_interval_ms) / 1000.0)
+
+    # postmessage / sendmessage 需要目标 hwnd
+    target_hwnd = 0
+    if click_driver in ("postmessage", "sendmessage"):
+        target_hwnd = find_window_by_title_sub(
+            foreground_window or "")[0] or ctypes.windll.user32.GetForegroundWindow()
+        if not target_hwnd:
+            print(f"[!] click_driver={click_driver} 需要游戏窗口，未找到")
+            return False
+
     for i in range(n):
         if i:
-            # 微小间隔 0 也不要真"无延迟连发"，系统不一定跟得上，5ms 兜底
             time.sleep(delay if delay > 0 else 0.005)
-        if action == "click":
-            send_left_click()
+
+        ok = False
+        if action in ("click", "lmb", "left", "mouse_left"):
+            driver_fn = DRIVERS.get(click_driver, _click_sendinput)
+            if click_driver in ("postmessage", "sendmessage"):
+                ok = driver_fn(target_hwnd)
+            else:
+                ok = driver_fn()
         else:
-            import keyboard
-            keyboard.press_and_release(action)
-    return True
+            ok = press_key(action)
+
+        # 备份：click 失败 → 按 key_fallback
+        if (not ok) and key_fallback:
+            fb = key_fallback.strip().lower()
+            vk = VK_MAP.get(fb) or (int(fb[3:], 16) if fb.startswith("vk:") else None)
+            if vk:
+                print(f"[!] click 失败，改按 key_fallback={key_fallback!r}")
+                _press_key_sendinput(vk)
+                ok = True
+    return ok
 
 
 # ---------------- 配置读写 ----------------
@@ -368,7 +600,7 @@ def crop_wav(input_path, output_path, start_sec, end_sec):
 def run_diag(cfg):
     """
     环境诊断：逐步检查 COM、设备枚举、录音、播放、检测链路，
-    返回每一步的结果，便于定位“自测失败”到底卡在哪。
+    返回每一步的结果，便于定位"自测失败"到底卡在哪。
     """
     from numpy import abs as np_abs
 
@@ -414,6 +646,19 @@ def run_diag(cfg):
         return "已播放到默认输出设备"
     record("播放参考音效", _play)
 
+    # 点击驱动自检（不实际点击，只验证 API 调用）
+    def _drivers():
+        # SendInput：检查结构大小
+        cb = ctypes.sizeof(INPUT)
+        mi = MOUSEINPUT(0, 0, 0, 0, 0, 0)
+        results = [f"INPUT={cb} 字节, MOUSEINPUT={ctypes.sizeof(MOUSEINPUT)} 字节"]
+        # 找游戏窗口（如果有）
+        hwnd, title = find_window_by_title_sub(cfg.get("foreground_window", "") or "")
+        results.append(f"游戏窗口: hwnd={hwnd:#x} title={title!r}" if hwnd
+                       else f"游戏窗口: 未找到（前台={get_foreground_title()!r}）")
+        return " | ".join(results)
+    record("点击驱动自检", _drivers)
+
     return steps
 
 
@@ -426,7 +671,7 @@ def open_loopback(cfg):
         for m in sc.all_microphones(include_loopback=True):
             if kw in m.name:
                 return m, rate
-        raise RuntimeError(f"找不到含 “{kw}” 的输出设备")
+        raise RuntimeError(f"找不到含 「{kw}」 的输出设备")
     spk = sc.default_speaker()
     return sc.get_microphone(id=str(spk.name), include_loopback=True), rate
 
@@ -456,24 +701,34 @@ def main():
     init_com()
     running = {"on": True}
     keyboard.add_hotkey("f10", lambda: running.update(on=False))
-    keyboard.add_hotkey("f9", lambda: do_action(cfg["action"]))  # 手动抛竿
+    keyboard.add_hotkey("f9", lambda: do_action(
+        cfg["action"],
+        click_count=cfg.get("click_count", 1),
+        click_interval_ms=cfg.get("click_interval_ms", 80),
+        foreground_window=cfg.get("foreground_window", ""),
+        click_driver=cfg.get("click_driver", "sendinput"),
+        key_fallback=cfg.get("key_fallback", "")))  # 手动抛竿
 
-    print("=" * 56)
+    print("=" * 60)
     print("钓鱼挂机（声音版）已启动")
     print(f"  参考音效: {os.path.basename(wav)}")
     print(f"  得分阈值: {cfg['threshold']}  冷却: {cfg['cooldown']}s")
-    n_clicks = int(cfg.get('click_count', 1))
-    if n_clicks > 1:
-        print(f"  触发动作: {cfg['action']} × {n_clicks} "
-              f"(每 {cfg.get('click_interval_ms', 80)}ms)")
+    print(f"  点击驱动: {cfg.get('click_driver', 'sendinput')}  "
+          f"动作: {cfg['action']} × {cfg.get('click_count', 1)}")
+    print(f"  连续命中门槛: {cfg.get('min_strikes', 2)} 块 (≈ "
+          f"{int(cfg.get('min_strikes', 2)) * 50}ms)")
+    fw = cfg.get("foreground_window", "") or ""
+    if fw:
+        print(f"  前台窗口限制: 含 {fw!r} 才按键")
+        fg_now = get_foreground_title()
+        print(f"  当前前台: {fg_now!r}  → "
+              f"{'✓ 会触发' if fw in fg_now else '✗ 不会触发（切回游戏！）'}")
     else:
-        print(f"  触发动作: {cfg['action']}")
-    print(f"  连续命中门槛: {cfg.get('min_strikes', 3)} 块 (≈ "
-          f"{int(cfg.get('min_strikes', 3)) * 50}ms)")
-    fw = cfg.get('foreground_window', '') or ''
-    print(f"  前台窗口限制: {fw if fw else '（无，切出游戏也会按键，请慎用）'}")
+        print("  前台窗口限制: (无 —— 任何前台窗口都会按键！)")
+    kf = cfg.get("key_fallback", "") or ""
+    print(f"  key_fallback: {kf if kf else '(无)'}")
     print("  听到咬钩音效 -> 按键 | F9 手动抛竿 | F10 退出")
-    print("=" * 56)
+    print("=" * 60)
 
     mic, rate = open_loopback(cfg)
     tmpl = trim_silence(load_wav_mono(wav, rate), rate)
@@ -482,18 +737,33 @@ def main():
     chunk = max(int(rate * 0.05), 1024)
 
     last_press = 0.0
+    strike = 0
     with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
         while running["on"]:
             data = rec.record(numframes=chunk)
             mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
             buf.push(mono)
             score = det.best_score(buf.buf)
+            threshold = float(cfg["threshold"])
+            cooldown = float(cfg["cooldown"])
+            min_strikes = max(1, int(cfg.get("min_strikes", 2)))
             now = time.time()
-            if score >= float(cfg["threshold"]) and now - last_press >= float(cfg["cooldown"]):
-                do_action(cfg["action"])
+            if score >= threshold:
+                strike += 1
+            else:
+                strike = 0
+            if strike >= min_strikes and now - last_press >= cooldown:
+                do_action(
+                    cfg["action"],
+                    click_count=cfg.get("click_count", 1),
+                    click_interval_ms=cfg.get("click_interval_ms", 80),
+                    foreground_window=cfg.get("foreground_window", ""),
+                    click_driver=cfg.get("click_driver", "sendinput"),
+                    key_fallback=cfg.get("key_fallback", ""))
                 last_press = now
                 print(f"[{time.strftime('%H:%M:%S')}] 检测到咬钩音效 "
                       f"(得分 {score:.3f})，已触发 {cfg['action']}")
+                strike = 0
     print("已退出，祝钓鱼愉快！")
 
 

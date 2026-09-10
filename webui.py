@@ -74,13 +74,16 @@ def bot_loop():
             strike = 0  # 连续命中阈值的累计块数（每次触发后或低于阈值时清零）
             fw = str(cfg.get("foreground_window", "") or "")
             print(f"[bot_loop] 已就绪 | 阈值 {cfg['threshold']} | 冷却 "
-                  f"{cfg['cooldown']}s | 连击 {cfg.get('click_count', 3)} × "
-                  f"{cfg.get('click_interval_ms', 80)}ms | 连续命中 ≥ "
-                  f"{cfg.get('min_strikes', 3)} 块 | 前台窗口: "
-                  f"{fw if fw else '（不限——切出游戏也会按键！）'}")
+                  f"{cfg['cooldown']}s | 驱动 {cfg.get('click_driver', 'sendinput')} | "
+                  f"动作 {cfg['action']} × {cfg.get('click_count', 1)} | "
+                  f"连续命中 ≥ {cfg.get('min_strikes', 2)} 块 | 前台窗口: "
+                  f"{fw if fw else '（不限——切出游戏也会按键！）'} | "
+                  f"key_fallback: {cfg.get('key_fallback', '') or '(无)'}")
+            if not fw:
+                print("[!] 警告: foreground_window 为空，任何前台窗口都会收到按键")
             with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
                 while STATE["running"]:
-                    cfg = fb.load_config()  # 热更新阈值/冷却/动作/连击/前台等
+                    cfg = fb.load_config()  # 热更新阈值/冷却/动作/连击/前台/驱动等
                     data = rec.record(numframes=chunk)
                     mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
                     buf.push(mono)
@@ -94,10 +97,12 @@ def bot_loop():
 
                     threshold = float(cfg["threshold"])
                     cooldown = float(cfg["cooldown"])
-                    min_strikes = max(1, int(cfg.get("min_strikes", 3)))
-                    click_count = max(1, int(cfg.get("click_count", 3)))
+                    min_strikes = max(1, int(cfg.get("min_strikes", 2)))
+                    click_count = max(1, int(cfg.get("click_count", 1)))
                     click_interval_ms = int(cfg.get("click_interval_ms", 80))
                     foreground_window = str(cfg.get("foreground_window", "") or "")
+                    click_driver = str(cfg.get("click_driver", "sendinput"))
+                    key_fallback = str(cfg.get("key_fallback", "") or "")
 
                     # 连续命中门槛：只有持续命中（min_strikes 块以上）才算真的咬钩
                     if score >= threshold:
@@ -112,6 +117,8 @@ def bot_loop():
                             click_count=click_count,
                             click_interval_ms=click_interval_ms,
                             foreground_window=foreground_window,
+                            click_driver=click_driver,
+                            key_fallback=key_fallback,
                         )
                         last_press = now
                         STATE["count"] += 1
@@ -325,8 +332,10 @@ def test_action(countdown=3.0):
             cfg = fb.load_config()
             fb.do_action(
                 cfg["action"],
-                click_count=int(cfg.get("click_count", 3)),
+                click_count=int(cfg.get("click_count", 1)),
                 click_interval_ms=int(cfg.get("click_interval_ms", 80)),
+                click_driver=str(cfg.get("click_driver", "sendinput")),
+                key_fallback=str(cfg.get("key_fallback", "") or ""),
                 foreground_window="",  # 测试不限制前台
             )
         except Exception as e:
@@ -399,6 +408,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"default": dev,
                                  "devices": [m.name for m in
                                              sc.all_microphones(include_loopback=True)]})
+            elif self.path == "/api/drivers":
+                # 返回所有可选驱动 + 当前游戏窗口信息，方便诊断
+                fg = fb.get_foreground_title()
+                cfg = fb.load_config()
+                hwnd, title = fb.find_window_by_title_sub(
+                    cfg.get("foreground_window", "") or "")
+                self._send(200, {
+                    "drivers": ["sendinput", "mouse_event",
+                                "postmessage", "sendmessage"],
+                    "current_driver": cfg.get("click_driver", "sendinput"),
+                    "foreground": fg,
+                    "game_window": {"hwnd": hwnd, "title": title}
+                    if hwnd else None,
+                })
             elif self.path.startswith("/api/record/audio"):
                 # 加 ?ts=... 防缓存
                 rec_path = STATE["rec"].get("path")
@@ -425,8 +448,8 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = fb.load_config()
                 for k in ("sound_file", "threshold", "cooldown", "action",
                           "samplerate", "device",
-                          "click_count", "click_interval_ms", "min_strikes",
-                          "foreground_window"):
+                          "click_driver", "click_count", "click_interval_ms",
+                          "min_strikes", "foreground_window", "key_fallback"):
                     if k in data:
                         cfg[k] = data[k]
                 fb.save_config(cfg)
@@ -476,9 +499,24 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send(400, {"ok": False, "error": str(e)})
             elif self.path == "/api/test-action":
+                # 支持指定驱动：{"driver": "postmessage"} 或 {"driver": "mouse_event"}
+                body = self._body_json() or {}
+                # 临时切换驱动到这次测试
+                if body.get("driver"):
+                    driver = str(body["driver"])
+                    valid = ("sendinput", "mouse_event", "postmessage", "sendmessage")
+                    if driver not in valid:
+                        self._send(400, {"ok": False,
+                                         "error": f"未知驱动 {driver!r}，"
+                                                  f"可选: {list(valid)}"})
+                        return
+                    cfg = fb.load_config()
+                    cfg["click_driver"] = driver
+                    fb.save_config(cfg)
                 ok = test_action(3.0)
                 self._send(200, {"ok": ok,
-                                 "note": "3 秒后按下" if ok else "已在倒计时中"})
+                                 "note": "3 秒后按下" if ok else "已在倒计时中",
+                                 "driver": body.get("driver", "默认")})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
