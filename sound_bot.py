@@ -241,6 +241,81 @@ def play_file(path, samplerate=48000):
     sc.default_speaker().play(audio / peak, samplerate=samplerate)
 
 
+# ---------------- 录制 / 裁剪 ----------------
+def save_wav(path, audio, samplerate):
+    """把 float32 单声道数组写为 16-bit PCM wav。"""
+    audio = np.asarray(audio, dtype=np.float32)
+    peak = float(np.abs(audio).max()) or 1.0
+    pcm = np.clip(audio / peak * 32767, -32768, 32767).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(samplerate))
+        w.writeframes(pcm.tobytes())
+
+
+def record_loopback(cfg, duration_sec, output_path, on_progress=None, stop_flag=None):
+    """
+    从 loopback 设备录 `duration_sec` 秒到 `output_path`（wav）。
+    `on_progress(elapsed, peak)` 每 0.1 秒回调一次，便于前端显示倒计时/电平。
+    `stop_flag = {"flag": True/False}` 可中途打断（写盘保留已录制部分）。
+    """
+    init_com()
+    mic, rate = open_loopback(cfg)
+    chunk = max(int(rate * 0.05), 1024)
+    chunks = []
+    peak = 0.0
+    t0 = time.time()
+    last_tick = 0.0
+    with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
+        while True:
+            data = rec.record(numframes=chunk)
+            mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
+            mono = mono.astype(np.float32, copy=False)
+            chunks.append(mono)
+            peak = max(peak, float(np.abs(mono).max()))
+            now = time.time()
+            if on_progress and now - last_tick > 0.1:
+                last_tick = now
+                try:
+                    on_progress(min(duration_sec, now - t0), peak)
+                except Exception:
+                    pass
+            if now - t0 >= duration_sec:
+                break
+            if stop_flag is not None and stop_flag.get("flag"):
+                break
+    audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+    save_wav(output_path, audio, rate)
+    stopped_early = bool(stop_flag and stop_flag.get("flag"))
+    return {"path": output_path, "samplerate": rate,
+            "duration": len(audio) / rate, "peak": peak,
+            "stopped": stopped_early}
+
+
+def crop_wav(input_path, output_path, start_sec, end_sec):
+    """从 wav 中截取 start_sec~end_sec（端点裁剪，可负数：相对末尾）。"""
+    with wave.open(input_path, "rb") as w:
+        rate = w.getframerate()
+        sw = w.getsampwidth()
+        ch = w.getnchannels()
+        n = w.getnframes()
+        i0 = max(0, int(round(start_sec * rate)))
+        i1 = min(n, int(round(end_sec * rate)))
+        if i1 <= i0:
+            raise ValueError(f"无效区间: {start_sec}~{end_sec} (文件 {n/rate:.2f}s)")
+        w.setpos(i0)
+        raw = w.readframes(i1 - i0)
+    # 重写 wav
+    with wave.open(output_path, "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(sw)
+        w.setframerate(rate)
+        w.writeframes(raw)
+    return {"path": output_path, "start": i0 / rate, "end": i1 / rate,
+            "duration": (i1 - i0) / rate}
+
+
 def run_diag(cfg):
     """
     环境诊断：逐步检查 COM、设备枚举、录音、播放、检测链路，

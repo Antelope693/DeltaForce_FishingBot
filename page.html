@@ -29,9 +29,12 @@
   .bar i { display:block; height:100%; background:#7ddc7d; width:0%; }
   .ok { color:#7ddc7d; } .bad { color:#ff8080; } .muted { color:#8a93a5; }
   .warnc { color:#ffcc55; }
-  #msg, #test, #diag { font-size:13px; line-height:1.7; margin-top:6px; }
+  #msg, #test, #diag, #recInfo, #actInfo, #cropMsg { font-size:13px;
+            line-height:1.7; margin-top:6px; }
   table.diag { border-collapse:collapse; font-size:13px; margin-top:6px; }
   table.diag td { border:1px solid #3a4150; padding:3px 8px; }
+  audio { display:block; margin: 6px 0; }
+  .hint { color:#8a93a5; font-size:12px; margin-left:8px; }
 </style>
 </head>
 <body>
@@ -64,6 +67,34 @@
 <div id="test"></div>
 <div id="diag"></div>
 
+<h2>录制参考音效
+  <span class="hint">页面按钮或全局热键 Ctrl+Alt+R 触发，10 秒内可手动停止</span>
+</h2>
+<div class="row">
+  <button id="btnRecStart" onclick="recStart()">🎤 开始录制（10 秒）</button>
+  <button id="btnRecStop" class="stop" onclick="apiPost('/api/record/stop').then(refresh)">■ 标记停止</button>
+  <button id="btnRecRe" class="warn" onclick="recStart()" style="display:none">🔁 重新录制</button>
+</div>
+<div id="recInfo"></div>
+<div id="recEdit" style="display:none">
+  <audio id="recAudio" controls preload="auto"></audio>
+  <div class="row">
+    <label>起始(秒) <input id="cropStart" type="number" step="0.05" min="0"></label>
+    <label>结束(秒) <input id="cropEnd" type="number" step="0.05" min="0"></label>
+    <label>另存为 <input id="cropSaveAs" type="text" placeholder="留空=覆盖当前参考音效"></label>
+    <button onclick="saveCrop()">💾 裁剪并保存</button>
+  </div>
+  <div id="cropMsg"></div>
+</div>
+
+<h2>测试按键
+  <span class="hint">3 秒倒计时后按下「动作」键，留时间切回游戏窗口</span>
+</h2>
+<div class="row">
+  <button id="btnTestAct" onclick="apiPost('/api/test-action').then(refresh)">⌨️ 3秒后按下「动作」键</button>
+  <span id="actInfo" class="muted"></span>
+</div>
+
 <h2>启动 / 停止</h2>
 <div class="row">
   <button id="btnStart" onclick="apiPost('/api/start').then(refresh)">▶ 启动挂机</button>
@@ -76,6 +107,7 @@ const FIELDS = ["sound_file","threshold","cooldown","action","samplerate","devic
 let dirty = false;          // 有未保存的修改时不覆盖输入框
 let devicesLoaded = false;
 let shownConfig = "";       // 上次已渲染的服务端配置
+let lastRecUrl = "";        // 上次载入的 audio src，避免重复 set
 
 /* 用户一改动输入框就标记 dirty，避免被 0.5 秒的自动刷新覆盖 */
 $("cfgbox").addEventListener("input", () => markDirty());
@@ -84,7 +116,7 @@ function markDirty() {
   if (!dirty) {
     dirty = true;
     $("cfgbox").classList.add("dirty");
-    $("msg").innerHTML = '<span class="warnc">有未保存的修改，点“保存配置”后生效</span>';
+    $("msg").innerHTML = '<span class="warnc">有未保存的修改，点"保存配置"后生效</span>';
   }
 }
 
@@ -112,11 +144,11 @@ async function refresh() {
   try {
     const r = await (await fetch("/api/status")).json();
     const s = r.state, cfg = r.config;
-    // 只有在用户没有未保存修改、且服务端配置变化时才回填表单
     const sig = JSON.stringify(cfg);
     if (!dirty && sig !== shownConfig) { fillForm(cfg); shownConfig = sig; }
     if (!devicesLoaded) loadDevices(cfg);
 
+    // ---- 主状态 ----
     const run = s.running ? '<span class="ok">● 运行中</span>' : '<span class="bad">○ 已停止</span>';
     const hot = s.score >= cfg.threshold;
     $("status").innerHTML =
@@ -130,8 +162,69 @@ async function refresh() {
     $("btnStart").disabled = s.running;
     $("btnStop").disabled = !s.running;
 
+    // ---- 自测 / 诊断 ----
     if (s.test && (s.test.running || s.test.result)) showTest(s.test);
     if (s.diag && (s.diag.running || s.diag.result)) showDiag(s.diag);
+
+    // ---- 录制面板 ----
+    const rec = s.rec || {};
+    if (rec.state === "recording") {
+      const left = Math.max(0, rec.duration - rec.elapsed);
+      $("recInfo").innerHTML =
+        `<span class="warnc">● 录制中…</span> 已录制 ${rec.elapsed.toFixed(1)}s` +
+        ` / 总 ${rec.duration}s（还剩 ${left.toFixed(1)}s）` +
+        `<br><span class="hint">按 Ctrl+Alt+R 也能触发；想提前结束点"标记停止"（当前实现会录到自然结束）</span>`;
+      $("btnRecStart").disabled = true;
+      $("btnRecStop").disabled = false;
+      $("recEdit").style.display = "none";
+      $("btnRecRe").style.display = "none";
+    } else if (rec.state === "ready") {
+      $("recInfo").innerHTML =
+        `<span class="ok">✓ 录制完成</span> 时长 ${rec.duration}s` +
+        (rec.error ? ` ｜ <span class="bad">${rec.error}</span>` : "");
+      $("btnRecStart").disabled = false;
+      $("btnRecStop").disabled = true;
+      $("btnRecRe").style.display = "";
+      $("recEdit").style.display = "";
+      // 加载 audio（只在 path 变化时设 src，避免播放中断）
+      const url = `/api/record/audio?ts=${Date.now()}`;
+      if (lastRecUrl !== url) {
+        $("recAudio").src = url;
+        lastRecUrl = url;
+      }
+      // 默认起止：0~duration（用户可改）
+      const startInput = $("cropStart"), endInput = $("cropEnd");
+      if (startInput.value === "" || +endInput.value > rec.duration + 0.01) {
+        startInput.value = 0;
+        endInput.value = rec.duration;
+      }
+      // 起止边界保护
+      if (+endInput.value > rec.duration) endInput.value = rec.duration;
+    } else {
+      $("recInfo").innerHTML = rec.error ?
+        `<span class="bad">录制失败：${rec.error}</span>` :
+        '<span class="muted">未录制。点"开始录制"或按 Ctrl+Alt+R 录制 10 秒系统声音。</span>';
+      $("btnRecStart").disabled = false;
+      $("btnRecStop").disabled = true;
+      $("recEdit").style.display = "none";
+      $("btnRecRe").style.display = "none";
+    }
+
+    // ---- 按键测试倒计时 ----
+    const act = s.act || {};
+    if (act.running) {
+      $("actInfo").innerHTML = `<span class="warnc">● 倒计时 ${act.remaining.toFixed(1)}s</span>`;
+      $("btnTestAct").disabled = true;
+    } else {
+      $("btnTestAct").disabled = false;
+      // 仅在刚刚结束时显示
+      if ($("actInfo").dataset.wasRunning === "true") {
+        $("actInfo").innerHTML = '<span class="ok">已按下</span>';
+        setTimeout(() => { $("actInfo").textContent = ""; }, 1500);
+      }
+      $("actInfo").dataset.wasRunning = "";
+    }
+    if (act.running) $("actInfo").dataset.wasRunning = "true";
   } catch (e) {
     $("status").innerHTML = '<span class="bad">无法连接后台，控制台进程可能已退出（start.bat 窗口是否已关闭？）</span>';
   }
@@ -145,7 +238,7 @@ function showTest(t) {
     $("test").innerHTML = `<span class="ok">✓ 自测通过</span>（最高得分 ${r.score} ≥ 阈值 ${r.threshold}）`;
   } else if (r.error) {
     $("test").innerHTML = `<span class="bad">✗ 自测失败：${r.error}</span>` +
-      `<br><span class="muted">点“环境诊断”查看是哪一步失败</span>`;
+      `<br><span class="muted">点"环境诊断"查看是哪一步失败</span>`;
   } else {
     $("test").innerHTML = `<span class="bad">✗ 自测未通过</span>（最高得分 ${r.score} < 阈值 ${r.threshold}）` +
       `<br><span class="muted">声音链路通了但没匹配上：确认游戏声音从所选输出设备播放、参考音效正确</span>`;
@@ -192,6 +285,35 @@ async function apiPost(path) {
   const r = await (await fetch(path, {method: "POST"})).json();
   if (r.note) $("msg").textContent = r.note;
   return r;
+}
+
+async function recStart() {
+  await apiPost("/api/record/start");
+  lastRecUrl = "";  // 下次 ready 时强制重新加载 audio
+  refresh();
+}
+
+async function saveCrop() {
+  const start = +$("cropStart").value;
+  const end = +$("cropEnd").value;
+  const saveAs = $("cropSaveAs").value.trim();
+  if (!(start >= 0) || !(end > start)) {
+    $("cropMsg").innerHTML = '<span class="bad">起始/结束秒数无效（起始 ≥ 0，结束 > 起始）</span>';
+    return;
+  }
+  const r = await (await fetch("/api/record/save", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({start, end, save_as: saveAs || null})})).json();
+  if (r.ok) {
+    $("cropMsg").innerHTML =
+      `<span class="ok">✓ 已保存</span> ${start}s~${end}s（${r.info.duration.toFixed(2)}s）` +
+      ` → ${r.info.path.split(/[\\\\/]/).pop()}`;
+    // 重新拉配置（sound_file 可能改了）
+    lastRecUrl = "";  // 让下次刷新不重复设 src
+    refresh();
+  } else {
+    $("cropMsg").innerHTML = `<span class="bad">保存失败：${r.error}</span>`;
+  }
 }
 
 const runTest = () => apiPost("/api/test").then(r => { $("test").textContent = r.note || ""; });

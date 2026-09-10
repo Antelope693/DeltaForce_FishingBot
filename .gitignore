@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 config.json
+.recorded.wav
+_backup.wav
 .workbuddy/

@@ -25,6 +25,7 @@ import sound_bot as fb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_FILE = os.path.join(HERE, "page.html")
+REC_FILE = os.path.join(HERE, "_recorded.wav")  # 录制临时文件
 
 # ---------------- 全局状态 ----------------
 STATE = {
@@ -37,9 +38,14 @@ STATE = {
     "error": None,
     "test": {"running": False, "result": None},
     "diag": {"running": False, "result": None},
+    "rec": {"state": "idle", "elapsed": 0.0,   # state: idle/recording/ready
+            "duration": 0.0, "path": None, "error": None},
+    "act": {"running": False, "remaining": 0}, # 3 秒倒计时按键测试
 }
 _lock = threading.Lock()
 _bot_thread = None
+_rec_thread = None
+_rec_stop = {"flag": False}
 
 
 def bot_loop():
@@ -192,6 +198,131 @@ def play_reference():
     threading.Thread(target=work, daemon=True).start()
 
 
+# ---------------- 录制 / 裁剪 ----------------
+def start_recording(duration_sec=10.0):
+    """
+    开始录制：loopback 录 `duration_sec` 秒到 REC_FILE。
+    若已有录制文件则覆盖。
+    """
+    with _lock:
+        if STATE["rec"]["state"] == "recording":
+            return False
+        _rec_stop["flag"] = False
+        STATE["rec"] = {"state": "recording", "elapsed": 0.0,
+                        "duration": float(duration_sec),
+                        "path": None, "error": None}
+
+    def work():
+        fb.init_com()
+        try:
+            def on_progress(elapsed, peak):
+                STATE["rec"]["elapsed"] = round(elapsed, 1)
+            info = fb.record_loopback(fb.load_config(), duration_sec,
+                                      REC_FILE, on_progress=on_progress,
+                                      stop_flag=_rec_stop)
+            STATE["rec"]["path"] = info["path"]
+            STATE["rec"]["duration"] = round(info["duration"], 2)
+            STATE["rec"]["elapsed"] = STATE["rec"]["duration"]
+            STATE["rec"]["state"] = "ready"
+        except Exception as e:
+            traceback.print_exc()
+            STATE["rec"]["state"] = "idle"
+            STATE["rec"]["error"] = f"{type(e).__name__}: {e}"
+
+    global _rec_thread
+    _rec_thread = threading.Thread(target=work, daemon=True)
+    _rec_thread.start()
+    return True
+
+
+def stop_recording():
+    """立即停止录制（保留已录制部分）。"""
+    with _lock:
+        if STATE["rec"]["state"] != "recording":
+            return False
+        _rec_stop["flag"] = True
+        STATE["rec"]["error"] = "已标记停止，保存已录制部分…"
+    return True
+
+
+def save_cropped(start_sec, end_sec, save_as=None):
+    """
+    把上次录制结果裁剪为参考音效。
+    `save_as` = None 时覆盖原参考音效；否则保存为新文件名（相对工作目录）。
+    """
+    rec_path = STATE["rec"].get("path")
+    if not rec_path or not os.path.exists(rec_path):
+        raise FileNotFoundError("尚未录制音频")
+    if save_as:
+        out = save_as if os.path.isabs(save_as) else os.path.join(HERE, save_as)
+    else:
+        out = fb.resolve_sound_file(fb.load_config())
+    info = fb.crop_wav(rec_path, out, float(start_sec), float(end_sec))
+    # 把 sound_file 指向新文件（如果用户改了名字）
+    cfg = fb.load_config()
+    if os.path.abspath(out) != os.path.abspath(fb.resolve_sound_file(cfg)):
+        try:
+            cfg["sound_file"] = os.path.basename(out)
+            fb.save_config(cfg)
+        except Exception:
+            pass
+    return info
+
+
+def test_action(countdown=3.0):
+    """
+    倒计时 `countdown` 秒后，按配置中的 action。
+    给用户时间切到游戏窗口。
+    """
+    with _lock:
+        if STATE["act"]["running"]:
+            return False
+        STATE["act"] = {"running": True, "remaining": float(countdown)}
+
+    def work():
+        try:
+            t0 = time.time()
+            while True:
+                left = countdown - (time.time() - t0)
+                STATE["act"]["remaining"] = round(max(0, left), 1)
+                if left <= 0:
+                    break
+                time.sleep(0.1)
+            cfg = fb.load_config()
+            fb.do_action(cfg["action"])
+        except Exception as e:
+            traceback.print_exc()
+            STATE["error"] = f"按键测试失败: {e}"
+        finally:
+            STATE["act"]["running"] = False
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def register_global_hotkeys():
+    """
+    注册全局热键（键盘 hook，必须在主线程）：
+      Ctrl+Alt+R  -> 开始录制 10 秒
+      Ctrl+Alt+T  -> 3 秒倒计时后按键
+    """
+    try:
+        import keyboard
+    except Exception as e:
+        print(f"[提示] 未安装 keyboard 库，全局热键不可用（{e}）。仍可点页面按钮。")
+        return
+    try:
+        keyboard.add_hotkey("ctrl+alt+r",
+                            lambda: start_recording(10.0),
+                            suppress=False)
+        keyboard.add_hotkey("ctrl+alt+t",
+                            lambda: test_action(3.0),
+                            suppress=False)
+        print("[热键] Ctrl+Alt+R 录制 10 秒 ｜ Ctrl+Alt+T 3 秒后按键")
+    except Exception as e:
+        print(f"[提示] 全局热键注册失败: {e}（仍可点页面按钮）")
+
+
 # ---------------- HTTP ----------------
 class Handler(BaseHTTPRequestHandler):
 
@@ -229,6 +360,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"default": dev,
                                  "devices": [m.name for m in
                                              sc.all_microphones(include_loopback=True)]})
+            elif self.path.startswith("/api/record/audio"):
+                # 加 ?ts=... 防缓存
+                rec_path = STATE["rec"].get("path")
+                if not rec_path or not os.path.exists(rec_path):
+                    self._send(404, {"error": "尚未录制"})
+                    return
+                with open(rec_path, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -267,6 +412,32 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/play":
                 play_reference()
                 self._send(200, {"ok": True})
+            elif self.path == "/api/record/start":
+                # 可选 body: {"duration": 10}
+                body = self._body_json()
+                dur = float(body.get("duration", 10))
+                ok = start_recording(dur)
+                self._send(200, {"ok": ok,
+                                 "note": "已开始录制" if ok else "已在录制中"})
+            elif self.path == "/api/record/stop":
+                ok = stop_recording()
+                self._send(200, {"ok": ok,
+                                 "note": "标记停止" if ok else "当前未录制"})
+            elif self.path == "/api/record/save":
+                body = self._body_json()
+                start = float(body.get("start", 0))
+                end = float(body.get("end", 0))
+                save_as = (body.get("save_as") or "").strip() or None
+                try:
+                    info = save_cropped(start, end, save_as)
+                    self._send(200, {"ok": True, "info": info,
+                                     "note": f"已保存为 {os.path.basename(info['path'])}"})
+                except Exception as e:
+                    self._send(400, {"ok": False, "error": str(e)})
+            elif self.path == "/api/test-action":
+                ok = test_action(3.0)
+                self._send(200, {"ok": ok,
+                                 "note": "3 秒后按下" if ok else "已在倒计时中"})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -283,6 +454,9 @@ def main():
     if not args.no_elevate and not fb.is_admin():
         print("[提示] 正在申请管理员权限 ...")
         fb.elevate_and_exit()
+
+    # 全局热键（必须在主线程注册）
+    register_global_hotkeys()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
