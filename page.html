@@ -2,85 +2,85 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>钓鱼挂机控制台</title>
+<title>钓鱼挂机控制台（声音版）</title>
 <style>
   body { background:#1b1f27; color:#dfe3ea; font-family: "Microsoft YaHei", sans-serif;
-         max-width: 980px; margin: 0 auto; padding: 16px; }
+         max-width: 860px; margin: 0 auto; padding: 16px; }
   h1 { font-size: 20px; }
   h2 { font-size: 15px; margin: 18px 0 8px; color:#9fc1ff; }
   fieldset { border:1px solid #3a4150; margin:8px 0; }
   .row { display:flex; flex-wrap:wrap; gap:10px; margin:6px 0; align-items:center; }
   label { font-size:13px; }
-  input { width:90px; background:#12151c; color:#dfe3ea; border:1px solid #3a4150;
+  input { width:110px; background:#12151c; color:#dfe3ea; border:1px solid #3a4150;
           padding:4px 6px; font-size:13px; }
+  input[type=text] { width:260px; }
   button { background:#2b5cc4; color:#fff; border:none; padding:8px 18px;
            font-size:14px; cursor:pointer; margin-right:8px; }
   button.stop { background:#b03a3a; }
   button.warn { background:#8a6d2f; }
   #status { background:#12151c; border:1px solid #3a4150; padding:10px 12px;
             font-size:14px; line-height:1.9; }
-  #shot { max-width:100%; border:1px solid #3a4150; cursor:crosshair; margin-top:8px; }
+  .bar { display:inline-block; width:200px; height:10px; background:#262b36;
+         vertical-align:middle; margin:0 6px; border-radius:5px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:#7ddc7d; width:0%; }
   .ok { color:#7ddc7d; } .bad { color:#ff8080; } .muted { color:#8a93a5; }
   #msg { font-size:13px; min-height:18px; margin-top:6px; }
-  #countdown { font-size:14px; color:#ffcc55; min-height:20px; margin-top:6px; }
+  #test { font-size:13px; min-height:18px; margin-top:4px; }
 </style>
 </head>
 <body>
-<h1>🎣 钓鱼挂机控制台</h1>
+<h1>🎣 钓鱼挂机控制台（声音版：听到咬钩音效 → 左键）</h1>
 
 <div id="status">加载中…</div>
 
-<h2>第一步：截取屏幕，然后在截图上点击浮标（取色 + 设定监控区域）</h2>
-<div class="row">
-  <button class="warn" onclick="capture(3)">截取屏幕（点我后 3 秒内切到游戏）</button>
-  <button class="warn" onclick="capture(0)">立即截取</button>
-  <span class="muted">截图上点击的位置 = 浮标颜色采样点，周围方框 = 监控区域</span>
-</div>
-<div id="countdown"></div>
-<img id="shot" alt="点击上面的按钮截取屏幕" onclick="pick(event)" style="display:none">
-
-<h2>第二步：参数（方框大小就是监控区域 w/h，改完记得保存）</h2>
+<h2>参数</h2>
 <fieldset>
   <div class="row">
-    <label>区域 x <input id="rx" type="number"></label>
-    <label>y <input id="ry" type="number"></label>
-    <label>宽 <input id="rw" type="number"></label>
-    <label>高 <input id="rh" type="number"></label>
+    <label>参考音效 <input id="sound_file" type="text" placeholder="TIMETOUP.wav"></label>
   </div>
   <div class="row">
-    <label>颜色 R <input id="cr" type="number"></label>
-    <label>G <input id="cg" type="number"></label>
-    <label>B <input id="cb" type="number"></label>
-    <label>容差 <input id="tol" type="number"></label>
+    <label>得分阈值 <input id="threshold" type="number" step="0.05" min="0.3" max="1"></label>
+    <label>冷却(秒) <input id="cooldown" type="number" step="0.1"></label>
+    <label>动作 <input id="action" placeholder="click 或 f / space"></label>
   </div>
   <div class="row">
-    <label>动作 <input id="action" style="width:120px" placeholder="click 或 f / space"></label>
-    <label>冷却(秒) <input id="cd" type="number" step="0.1"></label>
-    <label>检测间隔(秒) <input id="itv" type="number" step="0.01"></label>
+    <label>监听设备 <select id="device"></select></label>
+    <label>采样率 <input id="samplerate" type="number"></label>
   </div>
 </fieldset>
 <div class="row">
   <button onclick="saveCfg()">保存配置</button>
-  <span class="muted">动作填 click = 鼠标左键，或填键名如 f、space</span>
+  <button class="warn" onclick="apiPost('/api/play')">▶ 试听音效</button>
+  <button class="warn" onclick="runTest()">🔍 自测（播放并验证检测）</button>
 </div>
+<div id="test"></div>
 <div id="msg"></div>
 
-<h2>第三步：启动 / 停止</h2>
+<h2>启动 / 停止</h2>
 <div class="row">
-  <button id="btnStart" onclick="startBot()">▶ 启动挂机</button>
-  <button id="btnStop" class="stop" onclick="stopBot()">■ 停止</button>
+  <button id="btnStart" onclick="apiPost('/api/start').then(refresh)">▶ 启动挂机</button>
+  <button id="btnStop" class="stop" onclick="apiPost('/api/stop').then(refresh)">■ 停止</button>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const fields = {rx:"0", ry:"1", rw:"2", rh:"3"};
 
 function fillForm(c) {
-  $("rx").value = c.region[0]; $("ry").value = c.region[1];
-  $("rw").value = c.region[2]; $("rh").value = c.region[3];
-  $("cr").value = c.color[0];  $("cg").value = c.color[1]; $("cb").value = c.color[2];
-  $("tol").value = c.tolerance; $("cd").value = c.cooldown;
-  $("itv").value = c.interval; $("action").value = c.action;
+  $("sound_file").value = c.sound_file;
+  $("threshold").value = c.threshold;
+  $("cooldown").value = c.cooldown;
+  $("action").value = c.action;
+  $("samplerate").value = c.samplerate;
+  const sel = $("device");
+  if (sel.dataset.loaded !== "1") {
+    fetch("/api/devices").then(r => r.json()).then(d => {
+      sel.innerHTML = '<option value="">（系统默认输出）</option>';
+      for (const n of d.devices)
+        sel.innerHTML += `<option value="${n.replace(/"/g,'&quot;')}">${n}</option>`;
+      sel.value = c.device || "";
+      sel.dataset.loaded = "1";
+    });
+  } else sel.value = c.device || "";
 }
 
 async function refresh() {
@@ -89,75 +89,61 @@ async function refresh() {
     fillForm(r.config);
     const s = r.state;
     const run = s.running ? '<span class="ok">● 运行中</span>' : '<span class="bad">○ 已停止</span>';
-    const pres = s.present === null ? "未检测"
-               : (s.present ? '<span class="ok">看到浮标颜色</span>'
-                            : '<span class="bad">看不到浮标颜色（将触发按键）</span>');
+    const hot = s.score >= r.config.threshold;
     $("status").innerHTML =
-      `状态：${run} ｜ 浮标颜色：${pres}<br>` +
-      `已触发次数：${s.count} ｜ 上次触发：${s.last || "无"}` +
+      `状态：${run} ｜ 当前得分：<span class="${hot?'ok':'muted'}">${s.score.toFixed(3)}</span>` +
+      `<span class="bar"><i id="scorebar"></i></span>阈值 ${r.config.threshold}` +
+      `<br>音频电平：${(s.level*100).toFixed(1)} ｜ 已触发：${s.count} 次 ｜ 上次触发：${s.last || "无"}` +
       (s.error ? `<br><span class="bad">错误：${s.error}</span>` : "");
+    const bar = $("scorebar");
+    if (bar) bar.style.width = Math.min(100, s.score*100) + "%";
     $("btnStart").disabled = s.running;
     $("btnStop").disabled = !s.running;
+    if (s.test && (s.test.running || s.test.result)) showTest(s.test);
   } catch (e) {
     $("status").innerHTML = '<span class="bad">无法连接后台，控制台进程可能已退出</span>';
   }
 }
 
+function showTest(t) {
+  if (t.running) { $("test").innerHTML = "自测中：正在播放音效并监听…"; return; }
+  const r = t.result;
+  if (!r) { $("test").textContent = ""; return; }
+  $("test").innerHTML = r.ok
+    ? `<span class="ok">✓ 自测通过</span>（最高得分 ${r.score} ≥ 阈值 ${r.threshold}）`
+    : `<span class="bad">✗ 自测未通过</span>（最高得分 ${r.score ?? "?"} < 阈值 ${r.threshold ?? "?"}）` +
+      (r.error ? ` 错误：${r.error}` : "，请确认游戏声音从所选输出设备播放");
+}
+
 async function saveCfg() {
   const body = {
-    region: [+$("rx").value, +$("ry").value, +$("rw").value, +$("rh").value],
-    color:  [+$("cr").value, +$("cg").value, +$("cb").value],
-    tolerance: +$("tol").value, cooldown: +$("cd").value,
-    interval: +$("itv").value, action: $("action").value.trim() || "click",
+    sound_file: $("sound_file").value.trim() || "TIMETOUP.wav",
+    threshold: +$("threshold").value,
+    cooldown: +$("cooldown").value,
+    action: $("action").value.trim() || "click",
+    samplerate: +$("samplerate").value || 48000,
+    device: $("device").value || null,
   };
   const r = await (await fetch("/api/config", {
-    method:"POST", headers:{"Content-Type":"application/json"},
+    method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body)})).json();
-  $("msg").textContent = r.ok ? "已保存" : ("保存失败: " + (r.error || ""));
+  $("msg").textContent = r.ok ? "已保存（采样率/设备改动在下次启动时生效）" : ("保存失败: " + (r.error || ""));
   refresh();
 }
 
-function capture(delay) {
-  const cd = $("countdown");
-  if (delay > 0) {
-    let left = delay;
-    cd.textContent = `${left} 秒后截屏，请切换到游戏画面…`;
-    const t = setInterval(() => {
-      left -= 1;
-      if (left <= 0) { clearInterval(t); cd.textContent = "截屏中…"; }
-      else cd.textContent = `${left} 秒后截屏，请切换到游戏画面…`;
-    }, 1000);
-    setTimeout(doCapture, delay * 1000);
-  } else doCapture();
-  function doCapture() {
-    $("shot").src = "/api/screenshot?delay=0&t=" + Date.now();
-    $("shot").style.display = "block";
-    $("shot").onload = () => cd.textContent = "截图完成：点击浮标即可取色";
-  }
+async function apiPost(path) {
+  const r = await (await fetch(path, {method: "POST"})).json();
+  if (r.note) $("msg").textContent = r.note;
+  return r;
 }
 
-async function pick(ev) {
-  const img = $("shot"), r = img.getBoundingClientRect();
-  const x = Math.round((ev.clientX - r.left) * img.naturalWidth / r.width);
-  const y = Math.round((ev.clientY - r.top) * img.naturalHeight / r.height);
-  const res = await (await fetch("/api/pick", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({x, y})})).json();
-  $("msg").textContent = res.ok ? res.message : ("取色失败: " + (res.error || ""));
-  refresh();
-}
-
-async function startBot() {
-  await fetch("/api/start", {method:"POST"});
-  refresh();
-}
-async function stopBot() {
-  await fetch("/api/stop", {method:"POST"});
-  refresh();
+async function runTest() {
+  const r = await apiPost("/api/test");
+  $("test").textContent = r.note || "";
 }
 
 refresh();
-setInterval(refresh, 1000);
+setInterval(refresh, 500);
 </script>
 </body>
 </html>

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-钓鱼挂机 Web 控制台
-==================
-在本地起一个网页，可视化地完成：改配置、截屏取色、启动/停止挂机。
+钓鱼挂机 Web 控制台（声音版）
+============================
+本地网页：改配置、选输出设备、自测检测、启动/停止挂机。
 
 用法：
   python webui.py            （自动申请管理员权限）
@@ -11,7 +11,6 @@
 """
 
 import argparse
-import io
 import json
 import os
 import threading
@@ -19,10 +18,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import mss
-import mss.tools
-
-import fishing_bot as fb
+import sound_bot as fb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_FILE = os.path.join(HERE, "page.html")
@@ -30,37 +26,56 @@ PAGE_FILE = os.path.join(HERE, "page.html")
 # ---------------- 全局状态 ----------------
 STATE = {
     "running": False,
-    "present": None,          # 当前是否检测到浮标颜色
-    "count": 0,               # 已触发次数
-    "last": None,             # 上次触发时间
+    "score": 0.0,        # 最近一次互相关得分
+    "level": 0.0,        # 当前音频电平（RMS）
+    "count": 0,          # 已触发次数
+    "last": None,        # 上次触发时间
     "error": None,
+    "test": {"running": False, "result": None},
 }
 _lock = threading.Lock()
 _bot_thread = None
-_last_press = 0.0
 
 
 def bot_loop():
-    """后台挂机线程：监控颜色，消失即按键。"""
-    global _last_press
-    with mss.MSS() as sct:
-        while STATE["running"]:
-            try:
-                cfg = fb.load_config()
-                present = fb.color_present(sct, cfg["region"], cfg["color"],
-                                           cfg["tolerance"])
-                STATE["present"] = present
-                STATE["error"] = None
-                now = time.time()
-                if not present and now - _last_press >= float(cfg["cooldown"]):
-                    fb.do_action(cfg["action"])
-                    _last_press = now
-                    STATE["count"] += 1
-                    STATE["last"] = time.strftime("%H:%M:%S")
-                time.sleep(float(cfg["interval"]))
-            except Exception as e:
-                STATE["error"] = str(e)
-                time.sleep(0.5)
+    """后台挂机线程：监听 loopback，听到咬钩音效即按键。"""
+    while STATE["running"]:
+        mic = None
+        try:
+            cfg = fb.load_config()
+            wav = fb.resolve_sound_file(cfg)
+            if not os.path.exists(wav):
+                raise FileNotFoundError(f"参考音效不存在: {wav}")
+            rate = int(cfg["samplerate"])
+            mic, _ = fb.open_loopback(cfg)
+            tmpl = fb.trim_silence(fb.load_wav_mono(wav, rate), rate)
+            det = fb.SoundDetector(tmpl, rate)
+            buf = fb.RollingBuffer(len(tmpl) + int(rate * 0.2))
+            chunk = max(int(rate * 0.05), 1024)
+            last_press = 0.0
+            with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
+                while STATE["running"]:
+                    cfg = fb.load_config()  # 热更新阈值/冷却/动作
+                    data = rec.record(numframes=chunk)
+                    mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
+                    buf.push(mono)
+                    score = det.best_score(buf.buf)
+                    STATE["score"] = round(score, 3)
+                    STATE["level"] = round(float(
+                        (mono.astype("float32") ** 2).mean() ** 0.5), 4)
+                    STATE["error"] = None
+                    now = time.time()
+                    if (score >= float(cfg["threshold"])
+                            and now - last_press >= float(cfg["cooldown"])):
+                        fb.do_action(cfg["action"])
+                        last_press = now
+                        STATE["count"] += 1
+                        STATE["last"] = time.strftime("%H:%M:%S")
+        except Exception as e:
+            STATE["error"] = str(e)
+            time.sleep(1.0)
+        finally:
+            pass  # recorder 上下文已自行关闭
 
 
 def start_bot():
@@ -71,6 +86,8 @@ def start_bot():
         STATE["running"] = True
         STATE["count"] = 0
         STATE["last"] = None
+        STATE["score"] = 0.0
+        STATE["error"] = None
         _bot_thread = threading.Thread(target=bot_loop, daemon=True)
         _bot_thread.start()
 
@@ -80,27 +97,66 @@ def stop_bot():
         STATE["running"] = False
 
 
-def grab_screen_png(delay=0.0):
-    """截取整个（虚拟）屏幕，返回 PNG 字节。delay 秒后才开始截。"""
-    if delay > 0:
-        time.sleep(delay)
-    with mss.MSS() as sct:
-        img = sct.grab(sct.monitors[0])  # 0 = 所有显示器的合并区域
-        return mss.tools.to_png(img.rgb, img.size)
+def run_self_test_async():
+    """离线自测：播放参考音效 -> 检测（不按键）。"""
+    def work():
+        try:
+            import soundcard as sc
+            import numpy as np
+            cfg = fb.load_config()
+            wav = fb.resolve_sound_file(cfg)
+            STATE["test"]["result"] = None
+            mic, rate = fb.open_loopback(cfg)
+            tmpl = fb.trim_silence(fb.load_wav_mono(wav, rate), rate)
+            det = fb.SoundDetector(tmpl, rate)
+            buf = fb.RollingBuffer(len(tmpl) + int(rate * 1.0))
+
+            def play():
+                time.sleep(0.5)
+                audio = fb.load_wav_mono(wav, 48000)
+                peak = float(np.abs(audio).max()) or 1.0
+                sc.default_speaker().play(audio / peak, samplerate=48000)
+
+            threading.Thread(target=play, daemon=True).start()
+            best, detected = 0.0, False
+            chunk = max(int(rate * 0.05), 1024)
+            t0 = time.time()
+            with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
+                while time.time() - t0 < 5.0:
+                    data = rec.record(numframes=chunk)
+                    mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
+                    buf.push(mono)
+                    s = det.best_score(buf.buf)
+                    best = max(best, s)
+                    if s >= float(cfg["threshold"]):
+                        detected = True
+                        break
+            STATE["test"]["result"] = {
+                "ok": detected,
+                "score": round(best, 3),
+                "threshold": float(cfg["threshold"]),
+            }
+        except Exception as e:
+            STATE["test"]["result"] = {"ok": False, "error": str(e)}
+        finally:
+            STATE["test"]["running"] = False
+
+    if not STATE["test"]["running"]:
+        STATE["test"]["running"] = True
+        STATE["test"]["result"] = None
+        threading.Thread(target=work, daemon=True).start()
 
 
-def pick_color(x, y):
-    """采样 (x,y) 处像素颜色，并把监控区域设为以该点为中心的方框。"""
-    cfg = fb.load_config()
-    w = int(cfg["region"][2])
-    h = int(cfg["region"][3])
-    with mss.MSS() as sct:
-        px = sct.grab({"left": x, "top": y, "width": 1, "height": 1})
-        b, g, r = px.raw[0], px.raw[1], px.raw[2]
-    cfg["color"] = [r, g, b]
-    cfg["region"] = [max(x - w // 2, 0), max(y - h // 2, 0), w, h]
-    fb.save_config(cfg)
-    return cfg
+def play_reference():
+    """试听参考音效。"""
+    def work():
+        import soundcard as sc
+        import numpy as np
+        wav = fb.resolve_sound_file(fb.load_config())
+        audio = fb.load_wav_mono(wav, 48000)
+        peak = float(np.abs(audio).max()) or 1.0
+        sc.default_speaker().play(audio / peak, samplerate=48000)
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ---------------- HTTP ----------------
@@ -109,10 +165,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, (dict, list)):
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        elif isinstance(body, str):
-            data = body.encode("utf-8")
         else:
-            data = body
+            data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -126,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
-    def log_message(self, fmt, *args):  # 安静模式
+    def log_message(self, fmt, *args):
         pass
 
     def do_GET(self):
@@ -135,17 +189,13 @@ class Handler(BaseHTTPRequestHandler):
                 with open(PAGE_FILE, "rb") as f:
                     self._send(200, f.read(), "text/html; charset=utf-8")
             elif self.path.startswith("/api/status"):
-                cfg = fb.load_config()
-                self._send(200, {"state": STATE, "config": cfg})
-            elif self.path.startswith("/api/screenshot"):
-                delay = 0.0
-                if "delay=" in self.path:
-                    try:
-                        delay = min(float(self.path.split("delay=")[1].split("&")[0]), 30)
-                    except ValueError:
-                        delay = 0.0
-                png = grab_screen_png(delay)
-                self._send(200, png, "image/png")
+                self._send(200, {"state": STATE, "config": fb.load_config()})
+            elif self.path.startswith("/api/devices"):
+                import soundcard as sc
+                dev = sc.default_speaker().name
+                self._send(200, {"default": dev,
+                                 "devices": [m.name for m in
+                                             sc.all_microphones(include_loopback=True)]})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -156,25 +206,31 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/config":
                 data = self._body_json()
                 cfg = fb.load_config()
-                for k in ("region", "color", "tolerance", "interval",
-                          "action", "cooldown", "calib_size"):
+                for k in ("sound_file", "threshold", "cooldown", "action",
+                          "samplerate", "device"):
                     if k in data:
                         cfg[k] = data[k]
                 fb.save_config(cfg)
-                self._send(200, {"ok": True, "config": cfg})
+                self._send(200, {"ok": True, "config": cfg,
+                                 "note": "采样率/设备改动在下次启动时生效"})
             elif self.path == "/api/start":
                 start_bot()
                 self._send(200, {"ok": True, "running": True})
             elif self.path == "/api/stop":
                 stop_bot()
                 self._send(200, {"ok": True, "running": False})
-            elif self.path == "/api/pick":
-                data = self._body_json()
-                x, y = int(data["x"]), int(data["y"])
-                cfg = pick_color(x, y)
-                self._send(200, {"ok": True, "config": cfg,
-                                 "message": f"已采样 RGB{tuple(cfg['color'])}，"
-                                            f"监控区域已移动到 ({x},{y}) 附近"})
+            elif self.path == "/api/test":
+                if STATE["running"]:
+                    play_reference()
+                    self._send(200, {"ok": True,
+                                     "note": "挂机运行中，已播放音效；若检测正常，几秒内会触发一次"})
+                else:
+                    run_self_test_async()
+                    self._send(200, {"ok": True,
+                                     "note": "自测已开始，约 5 秒后看结果"})
+            elif self.path == "/api/play":
+                play_reference()
+                self._send(200, {"ok": True})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -182,12 +238,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="钓鱼挂机 Web 控制台")
+    parser = argparse.ArgumentParser(description="钓鱼挂机 Web 控制台（声音版）")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--no-elevate", action="store_true",
-                        help="跳过管理员权限申请（仅供测试）")
-    parser.add_argument("--no-browser", action="store_true",
-                        help="不自动打开浏览器")
+    parser.add_argument("--no-elevate", action="store_true")
+    parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
     if not args.no_elevate and not fb.is_admin():
@@ -197,7 +251,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
     print("=" * 50)
-    print(f"钓鱼挂机 Web 控制台已启动: {url}")
+    print(f"钓鱼挂机 Web 控制台（声音版）已启动: {url}")
     print("浏览器关闭后，在本窗口按 Ctrl+C 退出。")
     print("=" * 50)
     if not args.no_browser:
