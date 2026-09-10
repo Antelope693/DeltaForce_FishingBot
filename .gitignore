@@ -3,4 +3,5 @@ __pycache__/
 config.json
 .recorded.wav
 _backup.wav
+overlay_pos.json
 .workbuddy/
