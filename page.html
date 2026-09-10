@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>钓鱼挂机控制台（声音版）</title>
+<title>钓鱼挂机控制台（声音版）· 食叶羚_SYL 出品</title>
 <style>
   body { background:#1b1f27; color:#dfe3ea; font-family: "Microsoft YaHei", sans-serif;
          max-width: 880px; margin: 0 auto; padding: 16px; }
@@ -34,10 +34,23 @@
   table.diag { border-collapse:collapse; font-size:13px; margin-top:6px; }
   table.diag td { border:1px solid #3a4150; padding:3px 8px; }
   .hint { color:#8a93a5; font-size:12px; margin-left:8px; }
+  .author-tag { display:inline-block; background:linear-gradient(135deg,#c79a3a,#e6c069);
+                color:#1b1f27; font-weight:bold; font-size:13px; padding:3px 12px;
+                border-radius:14px; vertical-align:middle; margin-left:10px;
+                letter-spacing:1px; box-shadow:0 0 8px rgba(230,192,105,.35); }
+  .author-wm { position:fixed; right:14px; bottom:40px; color:rgba(230,192,105,.55);
+               font-size:13px; font-weight:bold; letter-spacing:2px; pointer-events:none;
+               transform:rotate(-0deg); z-index:99; }
+  #footer { margin-top:26px; padding:12px 0 4px; border-top:1px dashed #3a4150;
+            text-align:center; font-size:15px; font-weight:bold; color:#e6c069;
+            letter-spacing:2px; }
+  #footer .sub { font-size:12px; font-weight:normal; color:#8a93a5; margin-top:4px;
+                 letter-spacing:0; }
 </style>
 </head>
 <body>
-<h1>🎣 钓鱼挂机控制台（声音版：咬钩 → 收鱼流程）</h1>
+<h1>🎣 钓鱼挂机控制台（声音版：咬钩 → 收鱼流程）<span class="author-tag">食叶羚_SYL</span></h1>
+<div class="author-wm">食叶羚_SYL</div>
 
 <div id="status">加载中…</div>
 <div id="winInfo" class="muted" style="margin-top:6px"></div>
@@ -262,5 +275,10 @@ setInterval(loadWinInfo, 2000);
 refresh();
 setInterval(refresh, 500);
 </script>
+
+<div id="footer">
+  开源免费，倒卖必究！
+  <div class="sub">作者：食叶羚_SYL ｜ 本软件在 GitHub 免费开源，任何收费售卖行为均未经作者授权</div>
+</div>
 </body>
 </html>

@@ -458,6 +458,8 @@ def main():
     print("=" * 50)
     print(f"钓鱼挂机 Web 控制台（声音版）已启动: {url}")
     print("浏览器关闭后，在本窗口按 Ctrl+C 退出。")
+    print("-" * 50)
+    print("作者：食叶羚_SYL ｜ 开源免费，倒卖必究！")
     print("=" * 50)
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
