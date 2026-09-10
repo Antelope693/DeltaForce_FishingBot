@@ -23,6 +23,11 @@ import time
 import wave
 
 import numpy as np
+import soundcard as sc
+
+# 说明：soundcard 必须在**主线程**完成导入——它在导入时会初始化所在线程的 COM，
+# 且无法容忍“本线程已初始化过”（会抛 Error 0x100000001）。
+# 所以：主线程先导入（本行），其他工作线程使用前调用 init_com() 单独初始化。
 
 # ---------------- 配置 ----------------
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -114,6 +119,22 @@ def elevate_and_exit():
 
 
 # ---------------- 音频解码 ----------------
+def init_com():
+    """
+    初始化当前线程的 COM。
+
+    soundcard 依赖 WASAPI(COM)，而 COM 是**按线程**初始化的：soundcard 只在
+    导入它的那个线程里初始化了 COM，其他线程（挂机线程、网页请求线程）直接
+    调用音频接口会报 Error 0x800401f0 (CO_E_NOTINITIALIZED)。
+    因此每个用到音频的线程都必须先调用本函数。
+    返回值无关紧要：S_FALSE=已初始化过，RPC_E_CHANGED_MODE=该线程已是 STA，都可用。
+    """
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 0x0)  # 0 = COINIT_MULTITHREADED
+    except Exception:
+        pass
+
+
 def load_wav_mono(path, target_rate):
     """读取 wav -> 单声道 float32 [-1,1] -> 重采样到 target_rate。"""
     with wave.open(path, "rb") as w:
@@ -212,9 +233,69 @@ def resolve_sound_file(cfg):
     return p
 
 
+def play_file(path, samplerate=48000):
+    """在调用线程内播放一个 wav（线程安全：内部会初始化 COM）。"""
+    init_com()
+    audio = load_wav_mono(path, samplerate)
+    peak = float(np.abs(audio).max()) or 1.0
+    sc.default_speaker().play(audio / peak, samplerate=samplerate)
+
+
+def run_diag(cfg):
+    """
+    环境诊断：逐步检查 COM、设备枚举、录音、播放、检测链路，
+    返回每一步的结果，便于定位“自测失败”到底卡在哪。
+    """
+    from numpy import abs as np_abs
+
+    steps = []
+
+    def record(name, fn):
+        try:
+            detail = fn()
+            steps.append({"name": name, "ok": True,
+                          "detail": "" if detail is None else str(detail)})
+            return True
+        except Exception as e:
+            steps.append({"name": name, "ok": False,
+                          "detail": f"{type(e).__name__}: {e}"})
+            return False
+
+    rate = int(cfg["samplerate"])
+    wav = resolve_sound_file(cfg)
+    holder = {}
+
+    record("初始化当前线程的 COM", lambda: init_com() or "OK")
+    record("枚举输出/录音设备",
+           lambda: f"共 {len(sc.all_microphones(include_loopback=True))} 个，"
+                   f"默认输出 {sc.default_speaker().name}")
+
+    def _open():
+        holder["mic"], _ = open_loopback(cfg)
+        return f"监听：{holder['mic'].name}"
+    if record("打开 loopback 监听设备", _open):
+        def _rec():
+            with holder["mic"].recorder(samplerate=rate, blocksize=4800) as rec:
+                data = rec.record(numframes=int(rate * 0.3))
+            mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
+            return f"录制 0.3s 成功，电平 {(np_abs(mono).mean()):.4f}"
+        record("录音测试（0.3 秒）", _rec)
+
+    record("加载参考音效",
+           lambda: f"{os.path.basename(wav)}，"
+                   f"{len(trim_silence(load_wav_mono(wav, rate), rate))/rate:.2f}s")
+
+    def _play():
+        play_file(wav, 48000)
+        return "已播放到默认输出设备"
+    record("播放参考音效", _play)
+
+    return steps
+
+
 def open_loopback(cfg):
     """按配置打开 loopback 录音设备。返回 (mic, rate)。"""
-    import soundcard as sc
+    init_com()  # 必须在调用线程内初始化 COM
     rate = int(cfg["samplerate"])
     if cfg.get("device"):
         kw = str(cfg["device"])
@@ -247,8 +328,8 @@ def main():
         return
 
     import keyboard
-    import soundcard as sc
 
+    init_com()
     running = {"on": True}
     keyboard.add_hotkey("f10", lambda: running.update(on=False))
     keyboard.add_hotkey("f9", lambda: do_action(cfg["action"]))  # 手动抛竿
@@ -286,7 +367,7 @@ def main():
 def run_self_test(cfg, wav):
     """自测：播放参考音效，验证 loopback 捕获 + 互相关检测全链路。"""
     import threading
-    import soundcard as sc
+    init_com()
     print("[自测] 打开 loopback ...")
     mic, rate = open_loopback(cfg)
     tmpl = trim_silence(load_wav_mono(wav, rate), rate)
@@ -297,8 +378,7 @@ def run_self_test(cfg, wav):
     def play():
         time.sleep(0.5)
         print("[自测] 播放参考音效 ...")
-        sc.default_speaker().play(load_wav_mono(wav, 48000) / max(
-            1e-9, np.abs(load_wav_mono(wav, 48000)).max()), samplerate=48000)
+        play_file(wav, 48000)  # 内部会初始化该线程的 COM
 
     threading.Thread(target=play, daemon=True).start()
 

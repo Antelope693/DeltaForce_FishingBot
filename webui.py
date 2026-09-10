@@ -15,8 +15,11 @@ import json
 import os
 import threading
 import time
+import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import soundcard as sc  # noqa: F401  必须在主线程导入（soundcard 导入时初始化 COM）
 
 import sound_bot as fb
 
@@ -27,11 +30,13 @@ PAGE_FILE = os.path.join(HERE, "page.html")
 STATE = {
     "running": False,
     "score": 0.0,        # 最近一次互相关得分
+    "peak": 0.0,         # 自上次触发以来的最高得分（调阈值用）
     "level": 0.0,        # 当前音频电平（RMS）
     "count": 0,          # 已触发次数
     "last": None,        # 上次触发时间
     "error": None,
     "test": {"running": False, "result": None},
+    "diag": {"running": False, "result": None},
 }
 _lock = threading.Lock()
 _bot_thread = None
@@ -39,8 +44,9 @@ _bot_thread = None
 
 def bot_loop():
     """后台挂机线程：监听 loopback，听到咬钩音效即按键。"""
+    # soundcard 依赖 COM，而 COM 按线程初始化，工作线程必须自己初始化一次
+    fb.init_com()
     while STATE["running"]:
-        mic = None
         try:
             cfg = fb.load_config()
             wav = fb.resolve_sound_file(cfg)
@@ -61,6 +67,7 @@ def bot_loop():
                     buf.push(mono)
                     score = det.best_score(buf.buf)
                     STATE["score"] = round(score, 3)
+                    STATE["peak"] = round(max(STATE["peak"], score), 3)
                     STATE["level"] = round(float(
                         (mono.astype("float32") ** 2).mean() ** 0.5), 4)
                     STATE["error"] = None
@@ -71,11 +78,11 @@ def bot_loop():
                         last_press = now
                         STATE["count"] += 1
                         STATE["last"] = time.strftime("%H:%M:%S")
+                        STATE["peak"] = 0.0  # 重置峰值，便于观察下一次咬钩
         except Exception as e:
-            STATE["error"] = str(e)
+            STATE["error"] = f"{type(e).__name__}: {e}"
+            traceback.print_exc()
             time.sleep(1.0)
-        finally:
-            pass  # recorder 上下文已自行关闭
 
 
 def start_bot():
@@ -87,6 +94,7 @@ def start_bot():
         STATE["count"] = 0
         STATE["last"] = None
         STATE["score"] = 0.0
+        STATE["peak"] = 0.0
         STATE["error"] = None
         _bot_thread = threading.Thread(target=bot_loop, daemon=True)
         _bot_thread.start()
@@ -100,9 +108,8 @@ def stop_bot():
 def run_self_test_async():
     """离线自测：播放参考音效 -> 检测（不按键）。"""
     def work():
+        fb.init_com()  # 工作线程必须初始化 COM，否则报 0x800401f0
         try:
-            import soundcard as sc
-            import numpy as np
             cfg = fb.load_config()
             wav = fb.resolve_sound_file(cfg)
             STATE["test"]["result"] = None
@@ -113,9 +120,12 @@ def run_self_test_async():
 
             def play():
                 time.sleep(0.5)
-                audio = fb.load_wav_mono(wav, 48000)
-                peak = float(np.abs(audio).max()) or 1.0
-                sc.default_speaker().play(audio / peak, samplerate=48000)
+                try:
+                    fb.play_file(wav, 48000)  # 内部初始化该线程 COM
+                except Exception as e:
+                    STATE["test"]["result"] = {
+                        "ok": False,
+                        "error": f"播放失败 {type(e).__name__}: {e}"}
 
             threading.Thread(target=play, daemon=True).start()
             best, detected = 0.0, False
@@ -137,25 +147,48 @@ def run_self_test_async():
                 "threshold": float(cfg["threshold"]),
             }
         except Exception as e:
-            STATE["test"]["result"] = {"ok": False, "error": str(e)}
+            traceback.print_exc()
+            STATE["test"]["result"] = {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "trace": traceback.format_exc().splitlines()[-3:],
+            }
         finally:
             STATE["test"]["running"] = False
 
+    t = threading.Thread(target=work, daemon=True)
     if not STATE["test"]["running"]:
         STATE["test"]["running"] = True
         STATE["test"]["result"] = None
+        t.start()
+
+
+def run_diag_async():
+    """环境诊断：逐项检查音频链路，定位失败原因。"""
+    def work():
+        fb.init_com()
+        try:
+            STATE["diag"]["result"] = {"steps": fb.run_diag(fb.load_config())}
+        except Exception as e:
+            traceback.print_exc()
+            STATE["diag"]["result"] = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            STATE["diag"]["running"] = False
+
+    if not STATE["diag"]["running"]:
+        STATE["diag"]["running"] = True
+        STATE["diag"]["result"] = None
         threading.Thread(target=work, daemon=True).start()
 
 
 def play_reference():
     """试听参考音效。"""
     def work():
-        import soundcard as sc
-        import numpy as np
-        wav = fb.resolve_sound_file(fb.load_config())
-        audio = fb.load_wav_mono(wav, 48000)
-        peak = float(np.abs(audio).max()) or 1.0
-        sc.default_speaker().play(audio / peak, samplerate=48000)
+        try:
+            fb.play_file(fb.resolve_sound_file(fb.load_config()), 48000)
+        except Exception as e:
+            traceback.print_exc()
+            STATE["error"] = f"播放失败 {type(e).__name__}: {e}"
     threading.Thread(target=work, daemon=True).start()
 
 
@@ -191,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/status"):
                 self._send(200, {"state": STATE, "config": fb.load_config()})
             elif self.path.startswith("/api/devices"):
-                import soundcard as sc
+                fb.init_com()  # 请求线程同样需要初始化 COM
                 dev = sc.default_speaker().name
                 self._send(200, {"default": dev,
                                  "devices": [m.name for m in
@@ -228,6 +261,9 @@ class Handler(BaseHTTPRequestHandler):
                     run_self_test_async()
                     self._send(200, {"ok": True,
                                      "note": "自测已开始，约 5 秒后看结果"})
+            elif self.path == "/api/diag":
+                run_diag_async()
+                self._send(200, {"ok": True, "note": "诊断中，稍后查看结果"})
             elif self.path == "/api/play":
                 play_reference()
                 self._send(200, {"ok": True})

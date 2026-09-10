@@ -5,27 +5,33 @@
 <title>钓鱼挂机控制台（声音版）</title>
 <style>
   body { background:#1b1f27; color:#dfe3ea; font-family: "Microsoft YaHei", sans-serif;
-         max-width: 860px; margin: 0 auto; padding: 16px; }
+         max-width: 880px; margin: 0 auto; padding: 16px; }
   h1 { font-size: 20px; }
   h2 { font-size: 15px; margin: 18px 0 8px; color:#9fc1ff; }
   fieldset { border:1px solid #3a4150; margin:8px 0; }
+  fieldset.dirty { border-color:#c79a3a; }
   .row { display:flex; flex-wrap:wrap; gap:10px; margin:6px 0; align-items:center; }
   label { font-size:13px; }
-  input { width:110px; background:#12151c; color:#dfe3ea; border:1px solid #3a4150;
-          padding:4px 6px; font-size:13px; }
-  input[type=text] { width:260px; }
+  input, select { background:#12151c; color:#dfe3ea; border:1px solid #3a4150;
+                  padding:4px 6px; font-size:13px; }
+  input { width:110px; }
+  input[type=text] { width:240px; }
+  select { width:260px; }
   button { background:#2b5cc4; color:#fff; border:none; padding:8px 18px;
            font-size:14px; cursor:pointer; margin-right:8px; }
   button.stop { background:#b03a3a; }
   button.warn { background:#8a6d2f; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
   #status { background:#12151c; border:1px solid #3a4150; padding:10px 12px;
             font-size:14px; line-height:1.9; }
-  .bar { display:inline-block; width:200px; height:10px; background:#262b36;
+  .bar { display:inline-block; width:180px; height:10px; background:#262b36;
          vertical-align:middle; margin:0 6px; border-radius:5px; overflow:hidden; }
   .bar i { display:block; height:100%; background:#7ddc7d; width:0%; }
   .ok { color:#7ddc7d; } .bad { color:#ff8080; } .muted { color:#8a93a5; }
-  #msg { font-size:13px; min-height:18px; margin-top:6px; }
-  #test { font-size:13px; min-height:18px; margin-top:4px; }
+  .warnc { color:#ffcc55; }
+  #msg, #test, #diag { font-size:13px; line-height:1.7; margin-top:6px; }
+  table.diag { border-collapse:collapse; font-size:13px; margin-top:6px; }
+  table.diag td { border:1px solid #3a4150; padding:3px 8px; }
 </style>
 </head>
 <body>
@@ -34,7 +40,7 @@
 <div id="status">加载中…</div>
 
 <h2>参数</h2>
-<fieldset>
+<fieldset id="cfgbox">
   <div class="row">
     <label>参考音效 <input id="sound_file" type="text" placeholder="TIMETOUP.wav"></label>
   </div>
@@ -49,12 +55,14 @@
   </div>
 </fieldset>
 <div class="row">
-  <button onclick="saveCfg()">保存配置</button>
+  <button onclick="saveCfg()">💾 保存配置</button>
   <button class="warn" onclick="apiPost('/api/play')">▶ 试听音效</button>
   <button class="warn" onclick="runTest()">🔍 自测（播放并验证检测）</button>
+  <button class="warn" onclick="runDiag()">🩺 环境诊断</button>
 </div>
-<div id="test"></div>
 <div id="msg"></div>
+<div id="test"></div>
+<div id="diag"></div>
 
 <h2>启动 / 停止</h2>
 <div class="row">
@@ -64,6 +72,21 @@
 
 <script>
 const $ = id => document.getElementById(id);
+const FIELDS = ["sound_file","threshold","cooldown","action","samplerate","device"];
+let dirty = false;          // 有未保存的修改时不覆盖输入框
+let devicesLoaded = false;
+let shownConfig = "";       // 上次已渲染的服务端配置
+
+/* 用户一改动输入框就标记 dirty，避免被 0.5 秒的自动刷新覆盖 */
+$("cfgbox").addEventListener("input", () => markDirty());
+$("cfgbox").addEventListener("change", () => markDirty());
+function markDirty() {
+  if (!dirty) {
+    dirty = true;
+    $("cfgbox").classList.add("dirty");
+    $("msg").innerHTML = '<span class="warnc">有未保存的修改，点“保存配置”后生效</span>';
+  }
+}
 
 function fillForm(c) {
   $("sound_file").value = c.sound_file;
@@ -71,37 +94,46 @@ function fillForm(c) {
   $("cooldown").value = c.cooldown;
   $("action").value = c.action;
   $("samplerate").value = c.samplerate;
-  const sel = $("device");
-  if (sel.dataset.loaded !== "1") {
-    fetch("/api/devices").then(r => r.json()).then(d => {
-      sel.innerHTML = '<option value="">（系统默认输出）</option>';
-      for (const n of d.devices)
-        sel.innerHTML += `<option value="${n.replace(/"/g,'&quot;')}">${n}</option>`;
-      sel.value = c.device || "";
-      sel.dataset.loaded = "1";
-    });
-  } else sel.value = c.device || "";
+  $("device").value = c.device || "";
+}
+
+function loadDevices(c) {
+  fetch("/api/devices").then(r => r.json()).then(d => {
+    const sel = $("device");
+    sel.innerHTML = '<option value="">（系统默认输出）</option>';
+    for (const n of d.devices)
+      sel.innerHTML += `<option value="${n.replace(/"/g,'&quot;')}">${n}</option>`;
+    sel.value = c.device || "";
+    devicesLoaded = true;
+  }).catch(() => { $("msg").innerHTML = '<span class="bad">设备列表加载失败</span>'; });
 }
 
 async function refresh() {
   try {
     const r = await (await fetch("/api/status")).json();
-    fillForm(r.config);
-    const s = r.state;
+    const s = r.state, cfg = r.config;
+    // 只有在用户没有未保存修改、且服务端配置变化时才回填表单
+    const sig = JSON.stringify(cfg);
+    if (!dirty && sig !== shownConfig) { fillForm(cfg); shownConfig = sig; }
+    if (!devicesLoaded) loadDevices(cfg);
+
     const run = s.running ? '<span class="ok">● 运行中</span>' : '<span class="bad">○ 已停止</span>';
-    const hot = s.score >= r.config.threshold;
+    const hot = s.score >= cfg.threshold;
     $("status").innerHTML =
       `状态：${run} ｜ 当前得分：<span class="${hot?'ok':'muted'}">${s.score.toFixed(3)}</span>` +
-      `<span class="bar"><i id="scorebar"></i></span>阈值 ${r.config.threshold}` +
-      `<br>音频电平：${(s.level*100).toFixed(1)} ｜ 已触发：${s.count} 次 ｜ 上次触发：${s.last || "无"}` +
+      `<span class="bar"><i id="scorebar"></i></span>阈值 ${cfg.threshold}` +
+      `<br>峰值(自上次触发)：<span class="warnc">${(s.peak ?? 0).toFixed(3)}</span>` +
+      ` ｜ 音频电平：${(s.level*100).toFixed(1)} ｜ 已触发：${s.count} 次 ｜ 上次触发：${s.last || "无"}` +
       (s.error ? `<br><span class="bad">错误：${s.error}</span>` : "");
     const bar = $("scorebar");
     if (bar) bar.style.width = Math.min(100, s.score*100) + "%";
     $("btnStart").disabled = s.running;
     $("btnStop").disabled = !s.running;
+
     if (s.test && (s.test.running || s.test.result)) showTest(s.test);
+    if (s.diag && (s.diag.running || s.diag.result)) showDiag(s.diag);
   } catch (e) {
-    $("status").innerHTML = '<span class="bad">无法连接后台，控制台进程可能已退出</span>';
+    $("status").innerHTML = '<span class="bad">无法连接后台，控制台进程可能已退出（start.bat 窗口是否已关闭？）</span>';
   }
 }
 
@@ -109,10 +141,27 @@ function showTest(t) {
   if (t.running) { $("test").innerHTML = "自测中：正在播放音效并监听…"; return; }
   const r = t.result;
   if (!r) { $("test").textContent = ""; return; }
-  $("test").innerHTML = r.ok
-    ? `<span class="ok">✓ 自测通过</span>（最高得分 ${r.score} ≥ 阈值 ${r.threshold}）`
-    : `<span class="bad">✗ 自测未通过</span>（最高得分 ${r.score ?? "?"} < 阈值 ${r.threshold ?? "?"}）` +
-      (r.error ? ` 错误：${r.error}` : "，请确认游戏声音从所选输出设备播放");
+  if (r.ok) {
+    $("test").innerHTML = `<span class="ok">✓ 自测通过</span>（最高得分 ${r.score} ≥ 阈值 ${r.threshold}）`;
+  } else if (r.error) {
+    $("test").innerHTML = `<span class="bad">✗ 自测失败：${r.error}</span>` +
+      `<br><span class="muted">点“环境诊断”查看是哪一步失败</span>`;
+  } else {
+    $("test").innerHTML = `<span class="bad">✗ 自测未通过</span>（最高得分 ${r.score} < 阈值 ${r.threshold}）` +
+      `<br><span class="muted">声音链路通了但没匹配上：确认游戏声音从所选输出设备播放、参考音效正确</span>`;
+  }
+}
+
+function showDiag(d) {
+  if (d.running) { $("diag").innerHTML = "诊断中…"; return; }
+  const r = d.result;
+  if (!r) { $("diag").textContent = ""; return; }
+  if (r.error) { $("diag").innerHTML = `<span class="bad">诊断失败：${r.error}</span>`; return; }
+  let html = '<table class="diag">';
+  for (const st of r.steps)
+    html += `<tr><td>${st.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'}</td>` +
+            `<td>${st.name}</td><td class="${st.ok?'muted':'bad'}">${st.detail}</td></tr>`;
+  $("diag").innerHTML = html + "</table>";
 }
 
 async function saveCfg() {
@@ -127,7 +176,15 @@ async function saveCfg() {
   const r = await (await fetch("/api/config", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body)})).json();
-  $("msg").textContent = r.ok ? "已保存（采样率/设备改动在下次启动时生效）" : ("保存失败: " + (r.error || ""));
+  if (r.ok) {
+    dirty = false;
+    $("cfgbox").classList.remove("dirty");
+    shownConfig = JSON.stringify(r.config);
+    fillForm(r.config);
+    $("msg").innerHTML = '<span class="ok">已保存</span>';
+  } else {
+    $("msg").innerHTML = `<span class="bad">保存失败：${r.error || "未知错误"}</span>`;
+  }
   refresh();
 }
 
@@ -137,10 +194,8 @@ async function apiPost(path) {
   return r;
 }
 
-async function runTest() {
-  const r = await apiPost("/api/test");
-  $("test").textContent = r.note || "";
-}
+const runTest = () => apiPost("/api/test").then(r => { $("test").textContent = r.note || ""; });
+const runDiag = () => apiPost("/api/diag").then(r => { $("diag").textContent = r.note || ""; });
 
 refresh();
 setInterval(refresh, 500);
