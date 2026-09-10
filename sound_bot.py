@@ -257,10 +257,24 @@ def is_admin():
         return False
 
 
+def elevate_args():
+    """
+    返回提权重启时应传给新进程的参数列表。
+
+    注意：打包成 exe 后 sys.argv[0] 是 **exe 自身路径**，它不能再当作参数传回去，
+    否则新进程的 argparse 会把它当成非法位置参数并报
+    "unrecognized arguments: ...\\xxx.exe" 直接退出。
+    脚本模式下 sys.argv[0] 是脚本路径，则必须保留（python.exe 需要它才能跑）。
+    """
+    if getattr(sys, "frozen", False):
+        return list(sys.argv[1:])
+    return [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
+
+
 def elevate_and_exit():
-    params = " ".join(f'"{a}"' for a in sys.argv)
+    params = " ".join(f'"{a}"' for a in elevate_args())
     ret = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, params, None, 1)
+        None, "runas", sys.executable, params or None, None, 1)
     if ret <= 32:
         print("[错误] 管理员权限申请被拒绝，无法继续。")
     sys.exit(0 if ret > 32 else 1)

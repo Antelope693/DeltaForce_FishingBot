@@ -400,8 +400,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
 
+def _pause_if_frozen(msg="按回车键关闭窗口 ..."):
+    """双击 exe 时控制台会瞬间关闭，暂停一下让用户能看到提示。"""
+    if getattr(sys, "frozen", False):
+        try:
+            input(f"\n{msg}")
+        except Exception:
+            pass
+
+
+class _Parser(argparse.ArgumentParser):
+    """参数报错时先停一下，避免控制台一闪而过看不到原因。"""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        _pause_if_frozen()
+        sys.exit(2)
+
+
+def _port_in_use(port):
+    """Windows 下 SO_REUSEADDR 会让第二个进程也能绑定同一端口，所以先主动探测一次。"""
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.6)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="钓鱼挂机 Web 控制台（声音版）")
+    parser = _Parser(description="钓鱼挂机 Web 控制台（声音版）")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-elevate", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
@@ -414,7 +441,19 @@ def main():
     # 全局热键（必须在主线程注册）
     register_global_hotkeys()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    # 注意：必须在本进程 bind 之前探测，否则连到的是自己刚建好的监听端口
+    if _port_in_use(args.port):
+        print(f"[错误] 端口 {args.port} 已被占用（可能是之前没关掉的挂机窗口）。")
+        print("       请先关掉那个窗口再运行本程序，否则会出现两个机器人同时乱点。")
+        _pause_if_frozen()
+        sys.exit(1)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError:
+        print(f"[错误] 端口 {args.port} 已被占用，可能已经有一个挂机窗口在运行。")
+        print("       请先关掉已打开的窗口；或在此窗口内用 --port 8888 换个端口启动。")
+        _pause_if_frozen()
+        sys.exit(1)
     url = f"http://127.0.0.1:{args.port}"
     print("=" * 50)
     print(f"钓鱼挂机 Web 控制台（声音版）已启动: {url}")
@@ -430,4 +469,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        _pause_if_frozen("出错了。按回车键关闭窗口 ...")
