@@ -25,7 +25,6 @@ import sound_bot as fb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_FILE = os.path.join(HERE, "page.html")
-REC_FILE = os.path.join(HERE, "_recorded.wav")  # 录制临时文件
 
 # ---------------- 全局状态 ----------------
 STATE = {
@@ -33,28 +32,26 @@ STATE = {
     "score": 0.0,        # 最近一次互相关得分
     "peak": 0.0,         # 自上次触发以来的最高得分（调阈值用）
     "level": 0.0,        # 当前音频电平（RMS）
-    "count": 0,          # 已触发次数
+    "count": 0,          # 已触发轮数
     "last": None,        # 上次触发时间
     "error": None,
+    "seq": {"busy": False, "steps": None},  # 当前/最近一轮收鱼流程
     "test": {"running": False, "result": None},
     "diag": {"running": False, "result": None},
-    "rec": {"state": "idle", "elapsed": 0.0,   # state: idle/recording/ready
-            "duration": 0.0, "path": None, "error": None},
-    "act": {"running": False, "remaining": 0}, # 3 秒倒计时按键测试
+    "act": {"running": False, "remaining": 0},  # 3 秒倒计时按键测试
 }
 _lock = threading.Lock()
 _bot_thread = None
-_rec_thread = None
-_rec_stop = {"flag": False}
 
 
 def bot_loop():
-    """后台挂机线程：监听 loopback，听到咬钩音效即按动作。
+    """后台挂机线程：监听 loopback，听到咬钩音效即执行一轮收鱼流程。
 
-    点击策略（修复旧版两大 bug）：
-      1. 单帧误触 → 引入「连续命中」：必须 min_strikes 个音频块连续超阈值才触发
-      2. 切出游戏后漏点 → 引入「前台窗口白名单」：前台窗口标题不含
-         cfg['foreground_window'] 时整轮跳过按键
+    流程（在独立线程里跑，不阻塞音频读取）：
+      抬杆(左键+提示音) → 等 interrupt_delay → 打断检视(左键)
+      → 等 recast_delay → 抛竿(左键)
+    触发后设置 busy_until 抑制窗口：整轮流程结束前不会再触发，
+    同时清空音频缓冲，避免同一段咬钩声音重复计数。
     """
     # soundcard 依赖 COM，而 COM 按线程初始化，工作线程必须自己初始化一次
     fb.init_com()
@@ -71,19 +68,19 @@ def bot_loop():
             buf = fb.RollingBuffer(len(tmpl) + int(rate * 0.2))
             chunk = max(int(rate * 0.05), 1024)
             last_press = 0.0
-            strike = 0  # 连续命中阈值的累计块数（每次触发后或低于阈值时清零）
+            busy_until = 0.0  # 收鱼流程结束前不再触发
             fw = str(cfg.get("foreground_window", "") or "")
             print(f"[bot_loop] 已就绪 | 阈值 {cfg['threshold']} | 冷却 "
-                  f"{cfg['cooldown']}s | 驱动 {cfg.get('click_driver', 'sendinput')} | "
-                  f"动作 {cfg['action']} × {cfg.get('click_count', 1)} | "
-                  f"连续命中 ≥ {cfg.get('min_strikes', 2)} 块 | 前台窗口: "
+                  f"{cfg['cooldown']}s | 驱动 mouse_event | 前台窗口: "
                   f"{fw if fw else '（不限——切出游戏也会按键！）'} | "
-                  f"key_fallback: {cfg.get('key_fallback', '') or '(无)'}")
+                  f"打断检视延迟 {cfg.get('interrupt_delay', 2.0)}s | "
+                  f"再次抛竿延迟 {cfg.get('recast_delay', 2.0)}s | "
+                  f"提示音 {'开' if cfg.get('notify_sound', True) else '关'}")
             if not fw:
                 print("[!] 警告: foreground_window 为空，任何前台窗口都会收到按键")
             with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
                 while STATE["running"]:
-                    cfg = fb.load_config()  # 热更新阈值/冷却/动作/连击/前台/驱动等
+                    cfg = fb.load_config()  # 热更新阈值/冷却/延迟/前台等
                     data = rec.record(numframes=chunk)
                     mono = data.mean(axis=1) if data.ndim > 1 else data[:, 0]
                     buf.push(mono)
@@ -97,34 +94,39 @@ def bot_loop():
 
                     threshold = float(cfg["threshold"])
                     cooldown = float(cfg["cooldown"])
-                    min_strikes = max(1, int(cfg.get("min_strikes", 2)))
-                    click_count = max(1, int(cfg.get("click_count", 1)))
-                    click_interval_ms = int(cfg.get("click_interval_ms", 80))
-                    foreground_window = str(cfg.get("foreground_window", "") or "")
-                    click_driver = str(cfg.get("click_driver", "sendinput"))
-                    key_fallback = str(cfg.get("key_fallback", "") or "")
 
-                    # 连续命中门槛：只有持续命中（min_strikes 块以上）才算真的咬钩
-                    if score >= threshold:
-                        strike += 1
-                    else:
-                        strike = 0
-
-                    if (strike >= min_strikes
-                            and now - last_press >= cooldown):
-                        fb.do_action(
-                            cfg["action"],
-                            click_count=click_count,
-                            click_interval_ms=click_interval_ms,
-                            foreground_window=foreground_window,
-                            click_driver=click_driver,
-                            key_fallback=key_fallback,
-                        )
+                    if (score >= threshold
+                            and now - last_press >= cooldown
+                            and now >= busy_until):
                         last_press = now
+                        busy_until = now + fb.sequence_duration(cfg)
+                        seq_cfg = dict(cfg)  # 本轮流程用触发时的参数快照
                         STATE["count"] += 1
                         STATE["last"] = time.strftime("%H:%M:%S")
                         STATE["peak"] = 0.0  # 重置峰值，便于观察下一次咬钩
-                        strike = 0
+                        buf.clear()  # 清空缓冲，避免同一段声音重复触发
+                        print(f"[{STATE['last']}] 检测到咬钩音效 "
+                              f"(得分 {score:.3f})，开始收鱼流程")
+
+                        def _run_seq(c=seq_cfg):
+                            try:
+                                fb.init_com()
+                                steps = fb.run_fishing_sequence(
+                                    c, should_stop=lambda: not STATE["running"])
+                                STATE["seq"] = {
+                                    "busy": any(s[1] for s in steps),
+                                    "steps": [list(s) for s in steps],
+                                }
+                                print(f"[流程] " + " → ".join(
+                                    f"{n}{'✓' if ok else '✗'}"
+                                    for n, ok in steps))
+                            except Exception as e:
+                                traceback.print_exc()
+                                STATE["error"] = f"流程异常: {e}"
+                            finally:
+                                STATE["seq"]["busy"] = False
+
+                        threading.Thread(target=_run_seq, daemon=True).start()
         except Exception as e:
             STATE["error"] = f"{type(e).__name__}: {e}"
             traceback.print_exc()
@@ -142,6 +144,7 @@ def start_bot():
         STATE["score"] = 0.0
         STATE["peak"] = 0.0
         STATE["error"] = None
+        STATE["seq"] = {"busy": False, "steps": None}
         _bot_thread = threading.Thread(target=bot_loop, daemon=True)
         _bot_thread.start()
 
@@ -238,82 +241,15 @@ def play_reference():
     threading.Thread(target=work, daemon=True).start()
 
 
-# ---------------- 录制 / 裁剪 ----------------
-def start_recording(duration_sec=10.0):
-    """
-    开始录制：loopback 录 `duration_sec` 秒到 REC_FILE。
-    若已有录制文件则覆盖。
-    """
-    with _lock:
-        if STATE["rec"]["state"] == "recording":
-            return False
-        _rec_stop["flag"] = False
-        STATE["rec"] = {"state": "recording", "elapsed": 0.0,
-                        "duration": float(duration_sec),
-                        "path": None, "error": None}
-
-    def work():
-        fb.init_com()
-        try:
-            def on_progress(elapsed, peak):
-                STATE["rec"]["elapsed"] = round(elapsed, 1)
-            info = fb.record_loopback(fb.load_config(), duration_sec,
-                                      REC_FILE, on_progress=on_progress,
-                                      stop_flag=_rec_stop)
-            STATE["rec"]["path"] = info["path"]
-            STATE["rec"]["duration"] = round(info["duration"], 2)
-            STATE["rec"]["elapsed"] = STATE["rec"]["duration"]
-            STATE["rec"]["state"] = "ready"
-        except Exception as e:
-            traceback.print_exc()
-            STATE["rec"]["state"] = "idle"
-            STATE["rec"]["error"] = f"{type(e).__name__}: {e}"
-
-    global _rec_thread
-    _rec_thread = threading.Thread(target=work, daemon=True)
-    _rec_thread.start()
-    return True
-
-
-def stop_recording():
-    """立即停止录制（保留已录制部分）。"""
-    with _lock:
-        if STATE["rec"]["state"] != "recording":
-            return False
-        _rec_stop["flag"] = True
-        STATE["rec"]["error"] = "已标记停止，保存已录制部分…"
-    return True
-
-
-def save_cropped(start_sec, end_sec, save_as=None):
-    """
-    把上次录制结果裁剪为参考音效。
-    `save_as` = None 时覆盖原参考音效；否则保存为新文件名（相对工作目录）。
-    """
-    rec_path = STATE["rec"].get("path")
-    if not rec_path or not os.path.exists(rec_path):
-        raise FileNotFoundError("尚未录制音频")
-    if save_as:
-        out = save_as if os.path.isabs(save_as) else os.path.join(HERE, save_as)
-    else:
-        out = fb.resolve_sound_file(fb.load_config())
-    info = fb.crop_wav(rec_path, out, float(start_sec), float(end_sec))
-    # 把 sound_file 指向新文件（如果用户改了名字）
-    cfg = fb.load_config()
-    if os.path.abspath(out) != os.path.abspath(fb.resolve_sound_file(cfg)):
-        try:
-            cfg["sound_file"] = os.path.basename(out)
-            fb.save_config(cfg)
-        except Exception:
-            pass
-    return info
+def play_notify_preview():
+    """试听抬杆提示音。"""
+    fb.play_notify_sound()
 
 
 def test_action(countdown=3.0):
     """
-    倒计时 `countdown` 秒后，按配置中的 action。
-    与挂机线程保持一致（也走连击），但不强制前台窗口——你想测按键时并不一定要把
-    焦点先切回游戏。
+    倒计时 `countdown` 秒后，用 mouse_event 点一下左键。
+    不强制前台窗口——你想测按键时并不一定要把焦点先切回游戏。
     """
     with _lock:
         if STATE["act"]["running"]:
@@ -329,15 +265,7 @@ def test_action(countdown=3.0):
                 if left <= 0:
                     break
                 time.sleep(0.1)
-            cfg = fb.load_config()
-            fb.do_action(
-                cfg["action"],
-                click_count=int(cfg.get("click_count", 1)),
-                click_interval_ms=int(cfg.get("click_interval_ms", 80)),
-                click_driver=str(cfg.get("click_driver", "sendinput")),
-                key_fallback=str(cfg.get("key_fallback", "") or ""),
-                foreground_window="",  # 测试不限制前台
-            )
+            fb.click_mouse()
         except Exception as e:
             traceback.print_exc()
             STATE["error"] = f"按键测试失败: {e}"
@@ -351,7 +279,6 @@ def test_action(countdown=3.0):
 def register_global_hotkeys():
     """
     注册全局热键（键盘 hook，必须在主线程）：
-      Ctrl+Alt+R  -> 开始录制 10 秒
       Ctrl+Alt+T  -> 3 秒倒计时后按键
     """
     try:
@@ -360,13 +287,10 @@ def register_global_hotkeys():
         print(f"[提示] 未安装 keyboard 库，全局热键不可用（{e}）。仍可点页面按钮。")
         return
     try:
-        keyboard.add_hotkey("ctrl+alt+r",
-                            lambda: start_recording(10.0),
-                            suppress=False)
         keyboard.add_hotkey("ctrl+alt+t",
                             lambda: test_action(3.0),
                             suppress=False)
-        print("[热键] Ctrl+Alt+R 录制 10 秒 ｜ Ctrl+Alt+T 3 秒后按键")
+        print("[热键] Ctrl+Alt+T 3 秒后按键")
     except Exception as e:
         print(f"[提示] 全局热键注册失败: {e}（仍可点页面按钮）")
 
@@ -408,34 +332,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"default": dev,
                                  "devices": [m.name for m in
                                              sc.all_microphones(include_loopback=True)]})
-            elif self.path == "/api/drivers":
-                # 返回所有可选驱动 + 当前游戏窗口信息，方便诊断
+            elif self.path == "/api/window":
+                # 前台窗口 + 游戏窗口信息，方便诊断
                 fg = fb.get_foreground_title()
                 cfg = fb.load_config()
                 hwnd, title = fb.find_window_by_title_sub(
                     cfg.get("foreground_window", "") or "")
                 self._send(200, {
-                    "drivers": ["sendinput", "mouse_event",
-                                "postmessage", "sendmessage"],
-                    "current_driver": cfg.get("click_driver", "sendinput"),
                     "foreground": fg,
                     "game_window": {"hwnd": hwnd, "title": title}
                     if hwnd else None,
                 })
-            elif self.path.startswith("/api/record/audio"):
-                # 加 ?ts=... 防缓存
-                rec_path = STATE["rec"].get("path")
-                if not rec_path or not os.path.exists(rec_path):
-                    self._send(404, {"error": "尚未录制"})
-                    return
-                with open(rec_path, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(data)
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -446,10 +353,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/config":
                 data = self._body_json()
                 cfg = fb.load_config()
-                for k in ("sound_file", "threshold", "cooldown", "action",
-                          "samplerate", "device",
-                          "click_driver", "click_count", "click_interval_ms",
-                          "min_strikes", "foreground_window", "key_fallback"):
+                for k in ("threshold", "cooldown",
+                          "interrupt_delay", "recast_delay",
+                          "notify_sound", "foreground_window",
+                          "samplerate", "device"):
                     if k in data:
                         cfg[k] = data[k]
                 fb.save_config(cfg)
@@ -476,47 +383,13 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/play":
                 play_reference()
                 self._send(200, {"ok": True})
-            elif self.path == "/api/record/start":
-                # 可选 body: {"duration": 10}
-                body = self._body_json()
-                dur = float(body.get("duration", 10))
-                ok = start_recording(dur)
-                self._send(200, {"ok": ok,
-                                 "note": "已开始录制" if ok else "已在录制中"})
-            elif self.path == "/api/record/stop":
-                ok = stop_recording()
-                self._send(200, {"ok": ok,
-                                 "note": "标记停止" if ok else "当前未录制"})
-            elif self.path == "/api/record/save":
-                body = self._body_json()
-                start = float(body.get("start", 0))
-                end = float(body.get("end", 0))
-                save_as = (body.get("save_as") or "").strip() or None
-                try:
-                    info = save_cropped(start, end, save_as)
-                    self._send(200, {"ok": True, "info": info,
-                                     "note": f"已保存为 {os.path.basename(info['path'])}"})
-                except Exception as e:
-                    self._send(400, {"ok": False, "error": str(e)})
+            elif self.path == "/api/notify-preview":
+                play_notify_preview()
+                self._send(200, {"ok": True, "note": "已播放提示音"})
             elif self.path == "/api/test-action":
-                # 支持指定驱动：{"driver": "postmessage"} 或 {"driver": "mouse_event"}
-                body = self._body_json() or {}
-                # 临时切换驱动到这次测试
-                if body.get("driver"):
-                    driver = str(body["driver"])
-                    valid = ("sendinput", "mouse_event", "postmessage", "sendmessage")
-                    if driver not in valid:
-                        self._send(400, {"ok": False,
-                                         "error": f"未知驱动 {driver!r}，"
-                                                  f"可选: {list(valid)}"})
-                        return
-                    cfg = fb.load_config()
-                    cfg["click_driver"] = driver
-                    fb.save_config(cfg)
                 ok = test_action(3.0)
                 self._send(200, {"ok": ok,
-                                 "note": "3 秒后按下" if ok else "已在倒计时中",
-                                 "driver": body.get("driver", "默认")})
+                                 "note": "3 秒后按下" if ok else "已在倒计时中"})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:

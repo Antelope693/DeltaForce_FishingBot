@@ -16,6 +16,7 @@
                   padding:4px 6px; font-size:13px; }
   input { width:110px; }
   input[type=text] { width:240px; }
+  input[type=checkbox] { width:auto; }
   select { width:260px; }
   button { background:#2b5cc4; color:#fff; border:none; padding:8px 18px;
            font-size:14px; cursor:pointer; margin-right:8px; }
@@ -29,52 +30,44 @@
   .bar i { display:block; height:100%; background:#7ddc7d; width:0%; }
   .ok { color:#7ddc7d; } .bad { color:#ff8080; } .muted { color:#8a93a5; }
   .warnc { color:#ffcc55; }
-  #msg, #test, #diag, #recInfo, #actInfo, #cropMsg { font-size:13px;
-            line-height:1.7; margin-top:6px; }
+  #msg, #test, #diag, #actInfo { font-size:13px; line-height:1.7; margin-top:6px; }
   table.diag { border-collapse:collapse; font-size:13px; margin-top:6px; }
   table.diag td { border:1px solid #3a4150; padding:3px 8px; }
-  audio { display:block; margin: 6px 0; }
   .hint { color:#8a93a5; font-size:12px; margin-left:8px; }
 </style>
 </head>
 <body>
-<h1>🎣 钓鱼挂机控制台（声音版：听到咬钩音效 → 左键）</h1>
+<h1>🎣 钓鱼挂机控制台（声音版：咬钩 → 收鱼流程）</h1>
 
 <div id="status">加载中…</div>
+<div id="winInfo" class="muted" style="margin-top:6px"></div>
 
 <h2>参数</h2>
 <fieldset id="cfgbox">
   <div class="row">
-    <label>参考音效 <input id="sound_file" type="text" placeholder="TIMETOUP.wav"></label>
+    <label>得分阈值 <input id="threshold" type="number" step="0.05" min="0.1" max="1"></label>
+    <label>冷却(秒) <input id="cooldown" type="number" step="0.1"></label>
+    <label>打断检视延迟(秒) <input id="interrupt_delay" type="number" step="0.5" min="0"
+      title="抬杆后等待多少秒再点一下打断检视"></label>
+    <label>再次抛竿延迟(秒) <input id="recast_delay" type="number" step="0.5" min="0"
+      title="打断检视后再等多少秒左键抛下一竿"></label>
   </div>
   <div class="row">
-    <label>得分阈值 <input id="threshold" type="number" step="0.05" min="0.3" max="1"></label>
-    <label>冷却(秒) <input id="cooldown" type="number" step="0.1"></label>
-    <label>动作 <input id="action" placeholder="click 或 f / space"></label>
+    <label>前台窗口限制 <input id="foreground_window" type="text"
+      placeholder="推荐填游戏标题子串（如 三角洲）"
+      title="仅当前台窗口标题含此子串时才点击；填游戏窗口标题的关键字，可彻底避免切出游戏后还在按键"></label>
+    <label><input id="notify_sound" type="checkbox"> 抬杆提示音
+      <span class="hint">轻柔的一声"叮~"，音量已压低</span></label>
   </div>
   <div class="row">
     <label>监听设备 <select id="device"></select></label>
     <label>采样率 <input id="samplerate" type="number"></label>
   </div>
-  <div class="row">
-    <label>连击次数 <input id="click_count" type="number" step="1" min="1" max="20" title="钓鱼收杆就是 1 下，别多加"></label>
-    <label>连击间隔(ms) <input id="click_interval_ms" type="number" step="20" min="0" title="每次连击之间的毫秒间隔"></label>
-    <label>连续命中门槛 <input id="min_strikes" type="number" step="1" min="1" max="20" title="至少连续 N 个音频块命中阈值才触发（防单帧噪声）"></label>
-    <label>前台窗口限制 <input id="foreground_window" type="text" placeholder="推荐填游戏标题子串（如 三角洲）" title="仅当前台窗口标题含此子串时才点击；填游戏窗口标题的关键字，可彻底避免切出游戏后还在按键"></label>
-  </div>
-  <div class="row">
-    <label>点击驱动 <select id="click_driver" title="4 种点击实现，按顺序试：sendinput → mouse_event → postmessage → sendmessage">
-      <option value="sendinput">sendinput（标准 SendInput）</option>
-      <option value="mouse_event">mouse_event（旧 API，部分反作弊不拦）</option>
-      <option value="postmessage">postmessage（发消息到游戏窗口，绕过 raw-input 反作弊）</option>
-      <option value="sendmessage">sendmessage（同上但同步）</option>
-    </select></label>
-    <label>备用按键 <input id="key_fallback" type="text" placeholder="留空=不备用（点击失败时不补）" title="如果 click 被反作弊吞了，自动追加按这个键。空格=space，F 键=f，E 键=e 等"></label>
-  </div>
 </fieldset>
 <div class="row">
   <button onclick="saveCfg()">💾 保存配置</button>
   <button class="warn" onclick="apiPost('/api/play')">▶ 试听音效</button>
+  <button class="warn" onclick="apiPost('/api/notify-preview').then(r=>{$('msg').textContent=r.note||''})">🔔 试听提示音</button>
   <button class="warn" onclick="runTest()">🔍 自测（播放并验证检测）</button>
   <button class="warn" onclick="runDiag()">🩺 环境诊断</button>
 </div>
@@ -82,38 +75,13 @@
 <div id="test"></div>
 <div id="diag"></div>
 
-<h2>录制参考音效
-  <span class="hint">页面按钮或全局热键 Ctrl+Alt+R 触发，10 秒内可手动停止</span>
-</h2>
-<div class="row">
-  <button id="btnRecStart" onclick="recStart()">🎤 开始录制（10 秒）</button>
-  <button id="btnRecStop" class="stop" onclick="apiPost('/api/record/stop').then(refresh)">■ 标记停止</button>
-  <button id="btnRecRe" class="warn" onclick="recStart()" style="display:none">🔁 重新录制</button>
-</div>
-<div id="recInfo"></div>
-<div id="recEdit" style="display:none">
-  <audio id="recAudio" controls preload="auto"></audio>
-  <div class="row">
-    <label>起始(秒) <input id="cropStart" type="number" step="0.05" min="0"></label>
-    <label>结束(秒) <input id="cropEnd" type="number" step="0.05" min="0"></label>
-    <label>另存为 <input id="cropSaveAs" type="text" placeholder="留空=覆盖当前参考音效"></label>
-    <button onclick="saveCrop()">💾 裁剪并保存</button>
-  </div>
-  <div id="cropMsg"></div>
-</div>
-
 <h2>测试按键
-  <span class="hint">3 秒倒计时后按下「动作」键，留时间切回游戏窗口</span>
+  <span class="hint">3 秒倒计时后用 mouse_event 点一下左键，留时间切回游戏窗口</span>
 </h2>
 <div class="row">
-  <button id="btnTestAct" onclick="apiPost('/api/test-action').then(refresh)">⌨️ 3秒后按下（当前驱动）</button>
-  <button onclick="testDriver('sendinput').then(refresh)">sendinput 试一下</button>
-  <button onclick="testDriver('mouse_event').then(refresh)">mouse_event 试一下</button>
-  <button onclick="testDriver('postmessage').then(refresh)">postmessage 试一下</button>
-  <button onclick="testDriver('sendmessage').then(refresh)">sendmessage 试一下</button>
+  <button id="btnTestAct" onclick="apiPost('/api/test-action').then(refresh)">⌨️ 3秒后点一下左键</button>
   <span id="actInfo" class="muted"></span>
 </div>
-<div id="driverInfo" class="muted" style="margin-top:6px"></div>
 
 <h2>启动 / 停止</h2>
 <div class="row">
@@ -123,13 +91,11 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const FIELDS = ["sound_file","threshold","cooldown","action","samplerate","device",
-               "click_count","click_interval_ms","min_strikes","foreground_window",
-               "click_driver","key_fallback"];
+const FIELDS = ["threshold","cooldown","interrupt_delay","recast_delay",
+               "foreground_window","notify_sound","samplerate","device"];
 let dirty = false;          // 有未保存的修改时不覆盖输入框
 let devicesLoaded = false;
 let shownConfig = "";       // 上次已渲染的服务端配置
-let lastRecUrl = "";        // 上次载入的 audio src，避免重复 set
 
 /* 用户一改动输入框就标记 dirty，避免被 0.5 秒的自动刷新覆盖 */
 $("cfgbox").addEventListener("input", () => markDirty());
@@ -143,18 +109,14 @@ function markDirty() {
 }
 
 function fillForm(c) {
-  $("sound_file").value = c.sound_file;
   $("threshold").value = c.threshold;
   $("cooldown").value = c.cooldown;
-  $("action").value = c.action;
+  $("interrupt_delay").value = c.interrupt_delay;
+  $("recast_delay").value = c.recast_delay;
+  $("foreground_window").value = c.foreground_window || "";
+  $("notify_sound").checked = !!c.notify_sound;
   $("samplerate").value = c.samplerate;
   $("device").value = c.device || "";
-  $("click_count").value = c.click_count;
-  $("click_interval_ms").value = c.click_interval_ms;
-  $("min_strikes").value = c.min_strikes;
-  $("foreground_window").value = c.foreground_window || "";
-  $("click_driver").value = c.click_driver || "sendinput";
-  $("key_fallback").value = c.key_fallback || "";
 }
 
 function loadDevices(c) {
@@ -179,11 +141,19 @@ async function refresh() {
     // ---- 主状态 ----
     const run = s.running ? '<span class="ok">● 运行中</span>' : '<span class="bad">○ 已停止</span>';
     const hot = s.score >= cfg.threshold;
+    let seqInfo = "";
+    if (s.seq && s.seq.steps) {
+      seqInfo = `<br>上轮流程：` + s.seq.steps.map(
+        ([n, ok]) => `${n}${ok ? '✓' : '<span class="bad">✗</span>'}`).join(" → ");
+    } else if (s.seq && s.seq.busy) {
+      seqInfo = `<br><span class="warnc">收鱼流程进行中…</span>`;
+    }
     $("status").innerHTML =
       `状态：${run} ｜ 当前得分：<span class="${hot?'ok':'muted'}">${s.score.toFixed(3)}</span>` +
       `<span class="bar"><i id="scorebar"></i></span>阈值 ${cfg.threshold}` +
       `<br>峰值(自上次触发)：<span class="warnc">${(s.peak ?? 0).toFixed(3)}</span>` +
-      ` ｜ 音频电平：${(s.level*100).toFixed(1)} ｜ 已触发：${s.count} 次 ｜ 上次触发：${s.last || "无"}` +
+      ` ｜ 音频电平：${(s.level*100).toFixed(1)} ｜ 已收鱼：${s.count} 轮 ｜ 上次触发：${s.last || "无"}` +
+      seqInfo +
       (s.error ? `<br><span class="bad">错误：${s.error}</span>` : "");
     const bar = $("scorebar");
     if (bar) bar.style.width = Math.min(100, s.score*100) + "%";
@@ -194,50 +164,6 @@ async function refresh() {
     if (s.test && (s.test.running || s.test.result)) showTest(s.test);
     if (s.diag && (s.diag.running || s.diag.result)) showDiag(s.diag);
 
-    // ---- 录制面板 ----
-    const rec = s.rec || {};
-    if (rec.state === "recording") {
-      const left = Math.max(0, rec.duration - rec.elapsed);
-      $("recInfo").innerHTML =
-        `<span class="warnc">● 录制中…</span> 已录制 ${rec.elapsed.toFixed(1)}s` +
-        ` / 总 ${rec.duration}s（还剩 ${left.toFixed(1)}s）` +
-        `<br><span class="hint">按 Ctrl+Alt+R 也能触发；想提前结束点"标记停止"（当前实现会录到自然结束）</span>`;
-      $("btnRecStart").disabled = true;
-      $("btnRecStop").disabled = false;
-      $("recEdit").style.display = "none";
-      $("btnRecRe").style.display = "none";
-    } else if (rec.state === "ready") {
-      $("recInfo").innerHTML =
-        `<span class="ok">✓ 录制完成</span> 时长 ${rec.duration}s` +
-        (rec.error ? ` ｜ <span class="bad">${rec.error}</span>` : "");
-      $("btnRecStart").disabled = false;
-      $("btnRecStop").disabled = true;
-      $("btnRecRe").style.display = "";
-      $("recEdit").style.display = "";
-      // 加载 audio（只在 path 变化时设 src，避免播放中断）
-      const url = `/api/record/audio?ts=${Date.now()}`;
-      if (lastRecUrl !== url) {
-        $("recAudio").src = url;
-        lastRecUrl = url;
-      }
-      // 默认起止：0~duration（用户可改）
-      const startInput = $("cropStart"), endInput = $("cropEnd");
-      if (startInput.value === "" || +endInput.value > rec.duration + 0.01) {
-        startInput.value = 0;
-        endInput.value = rec.duration;
-      }
-      // 起止边界保护
-      if (+endInput.value > rec.duration) endInput.value = rec.duration;
-    } else {
-      $("recInfo").innerHTML = rec.error ?
-        `<span class="bad">录制失败：${rec.error}</span>` :
-        '<span class="muted">未录制。点"开始录制"或按 Ctrl+Alt+R 录制 10 秒系统声音。</span>';
-      $("btnRecStart").disabled = false;
-      $("btnRecStop").disabled = true;
-      $("recEdit").style.display = "none";
-      $("btnRecRe").style.display = "none";
-    }
-
     // ---- 按键测试倒计时 ----
     const act = s.act || {};
     if (act.running) {
@@ -247,7 +173,7 @@ async function refresh() {
       $("btnTestAct").disabled = false;
       // 仅在刚刚结束时显示
       if ($("actInfo").dataset.wasRunning === "true") {
-        $("actInfo").innerHTML = '<span class="ok">已按下</span>';
+        $("actInfo").innerHTML = '<span class="ok">已点下</span>';
         setTimeout(() => { $("actInfo").textContent = ""; }, 1500);
       }
       $("actInfo").dataset.wasRunning = "";
@@ -269,7 +195,7 @@ function showTest(t) {
       `<br><span class="muted">点"环境诊断"查看是哪一步失败</span>`;
   } else {
     $("test").innerHTML = `<span class="bad">✗ 自测未通过</span>（最高得分 ${r.score} < 阈值 ${r.threshold}）` +
-      `<br><span class="muted">声音链路通了但没匹配上：确认游戏声音从所选输出设备播放、参考音效正确</span>`;
+      `<br><span class="muted">声音链路通了但没匹配上：确认游戏声音从所选输出设备播放</span>`;
   }
 }
 
@@ -287,18 +213,14 @@ function showDiag(d) {
 
 async function saveCfg() {
   const body = {
-    sound_file: $("sound_file").value.trim() || "TIMETOUP.wav",
     threshold: +$("threshold").value,
     cooldown: +$("cooldown").value,
-    action: $("action").value.trim() || "click",
+    interrupt_delay: +$("interrupt_delay").value,
+    recast_delay: +$("recast_delay").value,
+    foreground_window: $("foreground_window").value.trim(),
+    notify_sound: $("notify_sound").checked,
     samplerate: +$("samplerate").value || 48000,
     device: $("device").value || null,
-    click_count: Math.max(1, Math.floor(+$("click_count").value || 1)),
-    click_interval_ms: Math.max(0, Math.floor(+$("click_interval_ms").value || 80)),
-    min_strikes: Math.max(1, Math.floor(+$("min_strikes").value || 2)),
-    foreground_window: $("foreground_window").value.trim(),
-    click_driver: $("click_driver").value || "sendinput",
-    key_fallback: $("key_fallback").value.trim(),
   };
   const r = await (await fetch("/api/config", {
     method: "POST", headers: {"Content-Type": "application/json"},
@@ -321,59 +243,21 @@ async function apiPost(path) {
   return r;
 }
 
-async function recStart() {
-  await apiPost("/api/record/start");
-  lastRecUrl = "";  // 下次 ready 时强制重新加载 audio
-  refresh();
-}
-
-async function saveCrop() {
-  const start = +$("cropStart").value;
-  const end = +$("cropEnd").value;
-  const saveAs = $("cropSaveAs").value.trim();
-  if (!(start >= 0) || !(end > start)) {
-    $("cropMsg").innerHTML = '<span class="bad">起始/结束秒数无效（起始 ≥ 0，结束 > 起始）</span>';
-    return;
-  }
-  const r = await (await fetch("/api/record/save", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({start, end, save_as: saveAs || null})})).json();
-  if (r.ok) {
-    $("cropMsg").innerHTML =
-      `<span class="ok">✓ 已保存</span> ${start}s~${end}s（${r.info.duration.toFixed(2)}s）` +
-      ` → ${r.info.path.split(/[\\\\/]/).pop()}`;
-    // 重新拉配置（sound_file 可能改了）
-    lastRecUrl = "";  // 让下次刷新不重复设 src
-    refresh();
-  } else {
-    $("cropMsg").innerHTML = `<span class="bad">保存失败：${r.error}</span>`;
-  }
-}
-
 const runTest = () => apiPost("/api/test").then(r => { $("test").textContent = r.note || ""; });
 const runDiag = () => apiPost("/api/diag").then(r => { $("diag").textContent = r.note || ""; });
 
-async function testDriver(driver) {
-  $("actInfo").innerHTML = `<span class="warnc">● 3 秒后将用 ${driver} 按下</span>`;
-  const r = await (await fetch("/api/test-action", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({driver: driver})})).json();
-  $("msg").innerHTML = r.note || (r.ok ? "已切换驱动，3 秒后按下" : "失败");
-  refresh();
-}
-
-async function loadDriverInfo() {
+async function loadWinInfo() {
   try {
-    const d = await (await fetch("/api/drivers")).json();
+    const d = await (await fetch("/api/window")).json();
     const fg = d.foreground || "（无）";
     const gw = d.game_window ? `hwnd=${d.game_window.hwnd} “${d.game_window.title}”`
                               : '<span class="bad">未找到游戏窗口</span>';
-    $("driverInfo").innerHTML =
-      `当前驱动：<b>${d.current_driver}</b> ｜ 前台窗口：${fg} ｜ ${gw}`;
+    $("winInfo").innerHTML =
+      `点击驱动：<b>mouse_event</b> ｜ 前台窗口：${fg} ｜ ${gw}`;
   } catch (e) {}
 }
-loadDriverInfo();
-setInterval(loadDriverInfo, 2000);
+loadWinInfo();
+setInterval(loadWinInfo, 2000);
 
 refresh();
 setInterval(refresh, 500);
