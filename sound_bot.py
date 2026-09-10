@@ -9,7 +9,7 @@
   1. 左键抬杆（播放轻柔提示音）
   2. 等待 interrupt_delay 秒（默认 2s）
   3. 左键打断检视
-  4. 等待 recast_delay 秒（默认 2s）
+  4. 等待 recast_delay 秒（默认 4s）
   5. 左键再次抛竿
 
 点击驱动：仅 mouse_event（实测三角洲里只有它不被吞）。
@@ -39,7 +39,15 @@ import soundcard as sc
 # 所以：主线程先导入（本行），其他工作线程使用前调用 init_com() 单独初始化。
 
 # ---------------- 配置 ----------------
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+def app_dir():
+    """程序所在目录。打包成单文件 exe 后，config.json 和 TIMETOUP.wav
+    应放在 exe 旁边（而不是解包临时目录），这样用户的配置和音频能保留。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_FILE = os.path.join(app_dir(), "config.json")
 
 DEFAULT_CONFIG = {
     # 参考音效文件（自带 TIMETOUP.wav，一般无需改）
@@ -52,7 +60,7 @@ DEFAULT_CONFIG = {
     # 抬杆后等待多少秒再点一下打断检视
     "interrupt_delay": 2.0,
     # 打断检视后再等多少秒左键抛下一竿
-    "recast_delay": 2.0,
+    "recast_delay": 4.0,
     # 抬杆时是否播放轻柔提示音
     "notify_sound": True,
     # ---- 防切走误点 ----
@@ -177,7 +185,7 @@ def run_fishing_sequence(cfg, should_stop=None):
     """
     fw = str(cfg.get("foreground_window", "") or "")
     d1 = max(0.0, float(cfg.get("interrupt_delay", 2.0)))
-    d2 = max(0.0, float(cfg.get("recast_delay", 2.0)))
+    d2 = max(0.0, float(cfg.get("recast_delay", 4.0)))
     notify = bool(cfg.get("notify_sound", True))
     steps = []
 
@@ -221,7 +229,7 @@ def run_fishing_sequence(cfg, should_stop=None):
 def sequence_duration(cfg):
     """一轮收鱼流程的总时长（秒），供调用方设置抑制窗口。"""
     return (max(0.0, float(cfg.get("interrupt_delay", 2.0)))
-            + max(0.0, float(cfg.get("recast_delay", 2.0))) + 0.5)
+            + max(0.0, float(cfg.get("recast_delay", 4.0))) + 0.5)
 
 
 # ---------------- 配置读写 ----------------
@@ -369,8 +377,7 @@ class RollingBuffer:
 def resolve_sound_file(cfg):
     p = cfg["sound_file"]
     if not os.path.isabs(p):
-        here = os.path.dirname(os.path.abspath(__file__))
-        p = os.path.join(here, p)
+        p = os.path.join(app_dir(), p)
     return p
 
 
@@ -490,7 +497,7 @@ def main():
     print(f"  得分阈值: {cfg['threshold']}  冷却: {cfg['cooldown']}s")
     print(f"  点击驱动: mouse_event（唯一可用）")
     print(f"  流程: 抬杆 → 等 {cfg.get('interrupt_delay', 2.0)}s 打断检视 → "
-          f"等 {cfg.get('recast_delay', 2.0)}s 抛竿")
+          f"等 {cfg.get('recast_delay', 4.0)}s 抛竿")
     print(f"  抬杆提示音: {'开' if cfg.get('notify_sound', True) else '关'}")
     fw = cfg.get("foreground_window", "") or ""
     if fw:

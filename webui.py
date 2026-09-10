@@ -13,6 +13,7 @@
 import argparse
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -23,8 +24,11 @@ import soundcard as sc  # noqa: F401  必须在主线程导入（soundcard 导�
 
 import sound_bot as fb
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-PAGE_FILE = os.path.join(HERE, "page.html")
+# 打包成 exe 后 page.html 被收进 exe 内部（--add-data）；源码运行时在脚本旁边
+if getattr(sys, "frozen", False):
+    PAGE_FILE = os.path.join(sys._MEIPASS, "page.html")
+else:
+    PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page.html")
 
 # ---------------- 全局状态 ----------------
 STATE = {
@@ -74,7 +78,7 @@ def bot_loop():
                   f"{cfg['cooldown']}s | 驱动 mouse_event | 前台窗口: "
                   f"{fw if fw else '（不限——切出游戏也会按键！）'} | "
                   f"打断检视延迟 {cfg.get('interrupt_delay', 2.0)}s | "
-                  f"再次抛竿延迟 {cfg.get('recast_delay', 2.0)}s | "
+                  f"再次抛竿延迟 {cfg.get('recast_delay', 4.0)}s | "
                   f"提示音 {'开' if cfg.get('notify_sound', True) else '关'}")
             if not fw:
                 print("[!] 警告: foreground_window 为空，任何前台窗口都会收到按键")
