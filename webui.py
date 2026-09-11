@@ -37,6 +37,7 @@ STATE = {
     "peak": 0.0,         # 自上次触发以来的最高得分（调阈值用）
     "level": 0.0,        # 当前音频电平（RMS）
     "count": 0,          # 已触发轮数
+    "fallback": 0,       # 漏听兜底点击次数
     "last": None,        # 上次触发时间
     "error": None,
     "seq": {"busy": False, "steps": None},  # 当前/最近一轮收鱼流程
@@ -56,9 +57,16 @@ def bot_loop():
       → 等 recast_delay → 抛竿(左键)
     触发后设置 busy_until 抑制窗口：整轮流程结束前不会再触发，
     同时清空音频缓冲，避免同一段咬钩声音重复计数。
+
+    漏听兜底：距上次点击超过 silence_timeout 秒（默认 20s）仍未检测到
+    咬钩——大概率是漏听了，前台是游戏时自动点一下左键进入下一轮。
+    抛竿静默保护：抛竿点击后 recast_quiet 秒（默认 5s）内忽略检测，
+    因为抛竿音效容易与咬钩音效误匹配。
     """
     # soundcard 依赖 COM，而 COM 按线程初始化，工作线程必须自己初始化一次
     fb.init_com()
+    # 跨线程共享：上次点击时刻 / 抛竿静默保护截止时刻（序列线程会更新）
+    shared = {"last_click": time.time(), "no_reel_until": 0.0}
     while STATE["running"]:
         try:
             cfg = fb.load_config()
@@ -74,11 +82,14 @@ def bot_loop():
             last_press = 0.0
             busy_until = 0.0  # 收鱼流程结束前不再触发
             fw = str(cfg.get("foreground_window", "") or "")
+            skip_logged = False  # 兜底因前台不符被跳过时只提示一次
             print(f"[bot_loop] 已就绪 | 阈值 {cfg['threshold']} | 冷却 "
                   f"{cfg['cooldown']}s | 驱动 mouse_event | 前台窗口: "
                   f"{fw if fw else '（不限——切出游戏也会按键！）'} | "
                   f"打断检视延迟 {cfg.get('interrupt_delay', 2.0)}s | "
                   f"再次抛竿延迟 {cfg.get('recast_delay', 4.0)}s | "
+                  f"漏听兜底 {cfg.get('silence_timeout', 20.0)}s | "
+                  f"抛竿静默 {cfg.get('recast_quiet', 5.0)}s | "
                   f"提示音 {'开' if cfg.get('notify_sound', True) else '关'}")
             if not fw:
                 print("[!] 警告: foreground_window 为空，任何前台窗口都会收到按键")
@@ -98,27 +109,34 @@ def bot_loop():
 
                     threshold = float(cfg["threshold"])
                     cooldown = float(cfg["cooldown"])
+                    silence_timeout = max(0.0, float(
+                        cfg.get("silence_timeout", 20.0)))
+                    recast_quiet = max(0.0, float(
+                        cfg.get("recast_quiet", 5.0)))
 
                     if (score >= threshold
                             and now - last_press >= cooldown
+                            and now >= shared["no_reel_until"]
                             and now >= busy_until):
                         last_press = now
                         busy_until = now + fb.sequence_duration(cfg)
+                        shared["last_click"] = now
                         seq_cfg = dict(cfg)  # 本轮流程用触发时的参数快照
                         STATE["count"] += 1
                         STATE["last"] = time.strftime("%H:%M:%S")
+                        STATE["seq"] = {"busy": True, "steps": None}
                         STATE["peak"] = 0.0  # 重置峰值，便于观察下一次咬钩
                         buf.clear()  # 清空缓冲，避免同一段声音重复触发
                         print(f"[{STATE['last']}] 检测到咬钩音效 "
                               f"(得分 {score:.3f})，开始收鱼流程")
 
-                        def _run_seq(c=seq_cfg):
+                        def _run_seq(c=seq_cfg, sh=shared):
                             try:
                                 fb.init_com()
                                 steps = fb.run_fishing_sequence(
                                     c, should_stop=lambda: not STATE["running"])
                                 STATE["seq"] = {
-                                    "busy": any(s[1] for s in steps),
+                                    "busy": False,
                                     "steps": [list(s) for s in steps],
                                 }
                                 print(f"[流程] " + " → ".join(
@@ -127,10 +145,36 @@ def bot_loop():
                             except Exception as e:
                                 traceback.print_exc()
                                 STATE["error"] = f"流程异常: {e}"
+                                STATE["seq"] = {"busy": False, "steps": None}
                             finally:
-                                STATE["seq"]["busy"] = False
+                                # 抛竿后进入静默保护，并重置漏听兜底计时
+                                sh["last_click"] = time.time()
+                                sh["no_reel_until"] = (
+                                    sh["last_click"]
+                                    + max(0.0, float(c.get("recast_quiet", 5.0))))
 
                         threading.Thread(target=_run_seq, daemon=True).start()
+                    elif (silence_timeout > 0
+                            and now - shared["last_click"] >= silence_timeout
+                            and now >= shared["no_reel_until"]
+                            and now >= busy_until
+                            and not STATE["seq"].get("busy")):
+                        # 漏听兜底：这么久没听到咬钩，大概率是漏听了
+                        if fb.foreground_matches(fw):
+                            fb.click_mouse()
+                            shared["last_click"] = now
+                            shared["no_reel_until"] = now + recast_quiet
+                            STATE["fallback"] += 1
+                            STATE["last"] = time.strftime("%H:%M:%S")
+                            buf.clear()
+                            skip_logged = False
+                            print(f"[{STATE['last']}] "
+                                  f"{silence_timeout:.0f}s 未检测到咬钩，"
+                                  f"兜底点击进入下一轮（累计 {STATE['fallback']} 次）")
+                        elif not skip_logged:
+                            print(f"[{time.strftime('%H:%M:%S')}] "
+                                  f"[兜底] 前台窗口不符，暂不点击；回到游戏后自动继续")
+                            skip_logged = True
         except Exception as e:
             STATE["error"] = f"{type(e).__name__}: {e}"
             traceback.print_exc()
@@ -144,6 +188,7 @@ def start_bot():
             return
         STATE["running"] = True
         STATE["count"] = 0
+        STATE["fallback"] = 0
         STATE["last"] = None
         STATE["score"] = 0.0
         STATE["peak"] = 0.0
@@ -359,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = fb.load_config()
                 for k in ("threshold", "cooldown",
                           "interrupt_delay", "recast_delay",
+                          "silence_timeout", "recast_quiet",
                           "notify_sound", "foreground_window",
                           "samplerate", "device"):
                     if k in data:

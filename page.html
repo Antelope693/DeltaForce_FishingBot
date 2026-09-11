@@ -66,6 +66,14 @@
       title="打断检视后再等多少秒左键抛下一竿"></label>
   </div>
   <div class="row">
+    <label>漏听兜底(秒) <input id="silence_timeout" type="number" step="1" min="0"
+      title="这么久没检测到咬钩就自动点一下左键进入下一轮（大概率是漏听了）；0 = 关闭"></label>
+    <span class="hint">20秒没听到咬钩 → 自动点一下进入下一轮；0 = 关闭</span>
+    <label>抛竿静默(秒) <input id="recast_quiet" type="number" step="0.5" min="0"
+      title="抛竿点击后这么多秒内忽略咬钩检测（抛竿音效容易误匹配）；0 = 关闭"></label>
+    <span class="hint">抛竿后5秒内不收杆（防误判）；0 = 关闭</span>
+  </div>
+  <div class="row">
     <label>前台窗口限制 <input id="foreground_window" type="text"
       placeholder="推荐填游戏标题子串（如 三角洲）"
       title="仅当前台窗口标题含此子串时才点击；填游戏窗口标题的关键字，可彻底避免切出游戏后还在按键"></label>
@@ -105,6 +113,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const FIELDS = ["threshold","cooldown","interrupt_delay","recast_delay",
+               "silence_timeout","recast_quiet",
                "foreground_window","notify_sound","samplerate","device"];
 let dirty = false;          // 有未保存的修改时不覆盖输入框
 let devicesLoaded = false;
@@ -126,6 +135,8 @@ function fillForm(c) {
   $("cooldown").value = c.cooldown;
   $("interrupt_delay").value = c.interrupt_delay;
   $("recast_delay").value = c.recast_delay;
+  $("silence_timeout").value = c.silence_timeout;
+  $("recast_quiet").value = c.recast_quiet;
   $("foreground_window").value = c.foreground_window || "";
   $("notify_sound").checked = !!c.notify_sound;
   $("samplerate").value = c.samplerate;
@@ -165,7 +176,7 @@ async function refresh() {
       `状态：${run} ｜ 当前得分：<span class="${hot?'ok':'muted'}">${s.score.toFixed(3)}</span>` +
       `<span class="bar"><i id="scorebar"></i></span>阈值 ${cfg.threshold}` +
       `<br>峰值(自上次触发)：<span class="warnc">${(s.peak ?? 0).toFixed(3)}</span>` +
-      ` ｜ 音频电平：${(s.level*100).toFixed(1)} ｜ 已收鱼：${s.count} 轮 ｜ 上次触发：${s.last || "无"}` +
+      ` ｜ 音频电平：${(s.level*100).toFixed(1)} ｜ 已收鱼：${s.count} 轮 ｜ 兜底：${s.fallback ?? 0} 次 ｜ 上次触发：${s.last || "无"}` +
       seqInfo +
       (s.error ? `<br><span class="bad">错误：${s.error}</span>` : "");
     const bar = $("scorebar");
@@ -230,6 +241,8 @@ async function saveCfg() {
     cooldown: +$("cooldown").value,
     interrupt_delay: +$("interrupt_delay").value,
     recast_delay: +$("recast_delay").value,
+    silence_timeout: +$("silence_timeout").value,
+    recast_quiet: +$("recast_quiet").value,
     foreground_window: $("foreground_window").value.trim(),
     notify_sound: $("notify_sound").checked,
     samplerate: +$("samplerate").value || 48000,

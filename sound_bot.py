@@ -12,6 +12,11 @@
   4. 等待 recast_delay 秒（默认 4s）
   5. 左键再次抛竿
 
+漏听兜底：距上次点击超过 silence_timeout 秒（默认 20s）仍未检测到咬钩，
+      大概率是漏听了——自动点一下左键进入下一轮。
+抛竿静默保护：抛竿点击后 recast_quiet 秒内（默认 5s）忽略检测，
+      因为抛竿音效容易与咬钩音效误匹配。
+
 点击驱动：仅 mouse_event（实测三角洲里只有它不被吞）。
 
 用法（命令行）：
@@ -63,6 +68,13 @@ DEFAULT_CONFIG = {
     "recast_delay": 4.0,
     # 抬杆时是否播放轻柔提示音
     "notify_sound": True,
+    # ---- 漏听兜底 ----
+    # 距上次点击超过此秒数仍未检测到咬钩，自动点一下左键进入下一轮
+    # （大概率是漏听了）。0 = 关闭兜底。
+    "silence_timeout": 20.0,
+    # ---- 抛竿静默保护 ----
+    # 抛竿点击后此秒数内忽略咬钩检测（抛竿音效容易误匹配）。0 = 关闭。
+    "recast_quiet": 5.0,
     # ---- 防切走误点 ----
     # 仅当当前前台窗口标题含此子串时才点击；空 = 不限制（强烈不推荐）。
     "foreground_window": "三角洲",
@@ -101,12 +113,20 @@ def get_foreground_title():
         return ""
 
 
+def foreground_matches(foreground_window):
+    """静默版前台匹配检查（不打印日志），供高频轮询（如漏听兜底）使用。"""
+    if not foreground_window:
+        return True
+    fg = get_foreground_title()
+    return foreground_window.lower() in fg.lower()
+
+
 def foreground_ok(foreground_window):
     """前台窗口是否匹配白名单。空 = 不限制。"""
     if not foreground_window:
         return True
-    fg = get_foreground_title()
-    if foreground_window.lower() not in fg.lower():
+    if not foreground_matches(foreground_window):
+        fg = get_foreground_title()
         print(f"[跳过] 前台窗口不符（当前={fg!r}，需含 {foreground_window!r}）")
         return False
     return True
@@ -521,6 +541,9 @@ def main():
               f"{'✓ 会触发' if fw in fg_now else '✗ 不会触发（切回游戏！）'}")
     else:
         print("  前台窗口限制: (无 —— 任何前台窗口都会按键！)")
+    st = max(0.0, float(cfg.get("silence_timeout", 20.0)))
+    rq = max(0.0, float(cfg.get("recast_quiet", 5.0)))
+    print(f"  漏听兜底: {st if st else '关'} | 抛竿静默保护: {rq if rq else '关'}")
     print("  听到咬钩音效 -> 自动收鱼 | F9 手动抛竿 | F10 退出")
     print("=" * 60)
 
@@ -531,6 +554,9 @@ def main():
     chunk = max(int(rate * 0.05), 1024)
 
     last_press = 0.0
+    last_click = time.time()   # 上次任何左键点击（抬杆/检视/抛竿/兜底）
+    no_reel_until = 0.0        # 抛竿静默保护截止时刻
+    skip_logged = False        # 兜底因前台不符被跳过时只提示一次
     with mic.recorder(samplerate=rate, blocksize=chunk) as rec:
         while running["on"]:
             data = rec.record(numframes=chunk)
@@ -539,13 +565,38 @@ def main():
             score = det.best_score(buf.buf)
             threshold = float(cfg["threshold"])
             cooldown = float(cfg["cooldown"])
+            silence_timeout = max(0.0, float(cfg.get("silence_timeout", 20.0)))
+            recast_quiet = max(0.0, float(cfg.get("recast_quiet", 5.0)))
             now = time.time()
-            if score >= threshold and now - last_press >= cooldown:
+            if (score >= threshold and now - last_press >= cooldown
+                    and now >= no_reel_until):
                 last_press = now
                 print(f"[{time.strftime('%H:%M:%S')}] 检测到咬钩音效 "
                       f"(得分 {score:.3f})，开始收鱼流程")
                 buf.clear()  # 清空缓冲，避免同一段声音重复触发
                 run_fishing_sequence(cfg, should_stop=lambda: not running["on"])
+                # 抛竿点击后进入静默保护，并重置漏听兜底计时
+                last_click = time.time()
+                no_reel_until = last_click + recast_quiet
+                skip_logged = False
+            elif (silence_timeout > 0
+                    and now - last_click >= silence_timeout
+                    and now >= no_reel_until):
+                # 漏听兜底：这么久没听到咬钩，大概率是漏听了
+                if foreground_matches(fw):
+                    click_mouse()
+                    last_click = now
+                    no_reel_until = now + recast_quiet
+                    buf.clear()
+                    skip_logged = False
+                    print(f"[{time.strftime('%H:%M:%S')}] "
+                          f"{silence_timeout:.0f}s 未检测到咬钩，"
+                          f"兜底点击进入下一轮")
+                else:
+                    if not skip_logged:
+                        print(f"[{time.strftime('%H:%M:%S')}] "
+                              f"[兜底] 前台窗口不符，暂不点击；回到游戏后自动继续")
+                        skip_logged = True
     print("已退出，祝钓鱼愉快！")
 
 
